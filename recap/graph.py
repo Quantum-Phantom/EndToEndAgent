@@ -95,43 +95,46 @@ def act_node(state: ReCAPState) -> dict:
 
     输入: state["messages"][-1].tool_calls, state["current_intent"]
     输出: current_action, messages (ToolMessage), ledger_entries (ActionEntry)
+    路由: -> observe_node（无条件）
+    """
+    ...
+
+
+def observe_node(state: ReCAPState) -> dict:
+    """Step 3 | Observe: 处理并标记环境返回结果，产生 ObservationEvent。
+
+    职责：
+    1. 从 ToolMessage 提取返回内容。
+    2. 强绑定 Observation 到 call_id 防止串线。
+    3. 标记来源与信任等级（SYSTEM->HIGH, TOOL->MEDIUM, EXTERNAL->LOW）。
+    4. 采集执行前后的状态差分（若环境可观察）。
+    5. 创建 ObligationEntry 跟踪证据义务。
+    6. 追加 ObservationEntry + ObligationEntry 到 ledger_entries。
+
+    输入: state["current_action"], state["messages"][-1] (ToolMessage)
+    输出: current_observation, ledger_entries (ObservationEntry/ObligationEntry)
     路由: -> act_observe_check_node（无条件）
     """
     ...
 
 
 def act_observe_check_node(state: ReCAPState) -> dict:
-    """Step 3 | Act->Observe 检查: 真实绑定与证据校验。
+    """Step 4 | Act->Observe 检查: 真实绑定与证据校验。
 
     职责：
-    1. 核对返回 call_id 与动作 call_id 一致（防串线）。
-    2. 比较状态差分与证书预期效果（若可观察）。
-    3. 检查 required_evidence 是否齐全：
+    1. 核对 Observation.call_id 与 Action.call_id 一致（防串线）。
+    2. 比较状态差分与证书预期效果（若可观察）；
+       无法证实 -> 将效果标记为 unknown。
+    3. 检查 required_evidence 是否已收集齐全：
        齐全 -> 关闭 ObligationEntry (FULFILLED)；
-       不足 -> 保持 PENDING，禁止虚假宣布成功。
-    4. 违规 -> 生成 ViolationEvidence。
+       不足 -> 保持 PENDING，禁止 Agent 虚假宣布成功。
+    4. 若违规 -> 生成 ViolationEvidence(EVIDENCE_INSUFFICIENT)。
 
-    输入: state["current_action"], state["current_observation"]
-    输出: check_results, ledger_entries (ObligationEntry/ViolationEntry)
-    路由: 通过 -> observe_node / 违规 -> think_node 或 END
-    """
-    ...
-
-
-def observe_node(state: ReCAPState) -> dict:
-    """Step 4 | Observe: 处理并标记环境返回结果。
-
-    职责：
-    1. 从 ToolMessage 提取返回内容。
-    2. 强绑定 Observation 到 call_id 防止串线。
-    3. 标记来源与信任等级（SYSTEM->HIGH, TOOL->MEDIUM, EXTERNAL->LOW）。
-    4. 比较状态差分与预期效果。
-    5. 创建 ObligationEntry 跟踪证据义务。
-    6. 追加 ObservationEntry + ObligationEntry 到 ledger_entries。
-
-    输入: state["current_action"], state["messages"][-1] (ToolMessage)
-    输出: current_observation, ledger_entries (ObservationEntry/ObligationEntry)
-    路由: -> observe_think_check_node（无条件）
+    输入: state["current_action"], state["current_observation"],
+          state["current_intent"].required_evidence
+    输出: check_results, ledger_entries (ObligationEntry/ViolationEntry),
+          current_observation (可能更新 is_complete/state_diff)
+    路由: 通过 -> observe_think_check_node / 违规 -> think_node 或 END
     """
     ...
 
@@ -171,25 +174,25 @@ def build_recap_graph() -> StateGraph:
         START
           |
           v
-      [think_node]
+      [think_node]              <-- Step 0: Think 生成意图证书
           |
           v (条件路由: should_continue_after_think)
           |-- 无 tool_calls --> END
           |
           v (有 tool_calls)
-      [think_act_check_node]  <-- Think->Act 承诺兑现检查
+      [think_act_check_node]    <-- Step 1: Think->Act 承诺兑现检查
           |
           v (通过/参数修复)
-      [act_node]               <-- Act 可信工具执行
+      [act_node]                <-- Step 2: Act 可信工具执行
           |
           v
-      [act_observe_check_node] <-- Act->Observe 证据校验
+      [observe_node]            <-- Step 3: Observe 产生 ObservationEvent
+          |
+          v
+      [act_observe_check_node]  <-- Step 4: Act->Observe 证据校验
           |
           v (通过)
-      [observe_node]           <-- Observe 结果标记
-          |
-          v
-      [observe_think_check_node] <-- Observe->Think 注入隔离
+      [observe_think_check_node] <-- Step 5: Observe->Think 注入隔离
           |
           v (进入下一轮)
       [think_node]  --> ...
@@ -223,9 +226,9 @@ def build_recap_graph() -> StateGraph:
         },
     )
     graph.add_edge("think_act_check_node", "act_node")
-    graph.add_edge("act_node", "act_observe_check_node")
-    graph.add_edge("act_observe_check_node", "observe_node")
-    graph.add_edge("observe_node", "observe_think_check_node")
+    graph.add_edge("act_node", "observe_node")
+    graph.add_edge("observe_node", "act_observe_check_node")
+    graph.add_edge("act_observe_check_node", "observe_think_check_node")
     graph.add_edge("observe_think_check_node", "think_node")
 
     return graph
