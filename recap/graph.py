@@ -166,57 +166,170 @@ def should_continue_after_think(state: ReCAPState) -> Literal["think_act_check_n
     ...
 
 
+def repair_node(state: ReCAPState) -> dict:
+    """Step R1 | Repair: 数据级恢复——参数修复与观测净化。
+
+    职责：
+    1. 读取最近一条 check_result，确定恢复动作类型。
+    2. PARAMETER_FIX：将越界参数收缩到 argument_constraints 允许范围内，
+       更新 current_intent 中的参数约束，追加 RepairEntry 到 ledger_entries。
+    3. PURIFY：对低信任 Observation 进行净化——剥离控制指令，
+       保留带来源标签的数据事实，填充 purified_observation。
+    4. 对不需要修复的状态（如通过检查后进入），作为 no-op 透传。
+
+    输入: state["check_results"][-1], state["current_intent"],
+          state["current_observation"]
+    输出: current_intent (可能被修复), current_observation (可能被净化),
+          ledger_entries (RepairEntry)
+    路由: -> replan_node（无条件）
+    """
+    ...
+
+
+def replan_node(state: ReCAPState) -> dict:
+    """Step R2 | Replan: 控制流级恢复——重规划编排。
+
+    职责：
+    1. 读取最近一条 check_result，确定恢复动作类型。
+    2. REPLAN：标记当前意图证书为 rejected，清理 current_intent/current_action，
+       设置 replan_context（包含违规摘要与约束提示），
+       追加 ReplanEntry 到 ledger_entries。
+    3. KEEP_UNFINISHED：保持未完成的 ObligationEntry 为 PENDING，
+       向上下文注入"任务未完成，禁止虚假宣布成功"的约束。
+    4. 对不需要重规划的状态，作为 no-op 透传。
+
+    输入: state["check_results"][-1], state["current_intent"],
+          state["ledger_entries"]
+    输出: current_intent (可能被清空), ledger_entries (ReplanEntry),
+          messages (可能追加约束提示)
+    路由: -> think_node（无条件，进入下一轮）
+    """
+    ...
+
+
+def route_after_think_act_check(
+    state: ReCAPState,
+) -> Literal["act_node", "repair_node", "__end__"]:
+    """Think→Act 检查后路由。
+
+    根据 TransitionResult 决定后续路径：
+    - passed=True 或 recovery=PARAMETER_FIX -> act_node（继续执行）
+    - recovery=REPLAN/KEEP_UNFINISHED -> repair_node（进入恢复流水线）
+    - recovery=BLOCK/HUMAN_ESCALATION -> END（终止）
+    """
+    ...
+
+
+def route_after_act_observe_check(
+    state: ReCAPState,
+) -> Literal["observe_think_check_node", "repair_node", "__end__"]:
+    """Act→Observe 检查后路由。
+
+    根据 TransitionResult 决定后续路径：
+    - passed=True -> observe_think_check_node（继续检查流水线）
+    - recovery=REPLAN/KEEP_UNFINISHED -> repair_node（进入恢复流水线）
+    - recovery=BLOCK/HUMAN_ESCALATION -> END（终止）
+    """
+    ...
+
+
+def route_after_observe_think_check(
+    state: ReCAPState,
+) -> Literal["repair_node", "__end__"]:
+    """Observe→Think 检查后路由。
+
+    根据 TransitionResult 决定后续路径：
+    - passed=True 或 recovery=PURIFY -> repair_node（进入恢复流水线，
+      正常通过时为 no-op 透传）
+    - recovery=BLOCK/HUMAN_ESCALATION -> END（终止）
+    """
+    ...
+
+
 def build_recap_graph() -> StateGraph:
     """构建 ReCAP 护栏增强的 ReAct Agent 图。
 
     图拓扑（每轮完整流程）:
 
-        START
-          |
-          v
-      [think_node]              <-- Step 0: Think 生成意图证书
-          |
-          v (条件路由: should_continue_after_think)
-          |-- 无 tool_calls --> END
-          |
-          v (有 tool_calls)
-      [think_act_check_node]    <-- Step 1: Think->Act 承诺兑现检查
-          |
-          v (通过/参数修复)
-      [act_node]                <-- Step 2: Act 可信工具执行
-          |
-          v
-      [observe_node]            <-- Step 3: Observe 产生 ObservationEvent
-          |
-          v
-      [act_observe_check_node]  <-- Step 4: Act->Observe 证据校验
-          |
-          v (通过)
-      [observe_think_check_node] <-- Step 5: Observe->Think 注入隔离
-          |
-          v (进入下一轮)
-      [think_node]  --> ...
+                              ┌── 违规时跳过中间节点 ──────────────────┐
+                              │  think_act_check ──(replan)────────┐   │
+                              │  act_observe_check ──(replan)──────┤   │
+                              │  observe_think_check ──(purify)────┤   │
+                              │                                     │   │
+        START                  │                                     │   │
+          |                    │                                     │   │
+          v                    │                                     │   │
+      [think_node]  Step 0    │                                     │   │
+          |                    │                                     │   │
+          v (有 tool_calls)    │                                     │   │
+      [think_act_check_node]  Step 1                                │   │
+          |                    │                                     │   │
+          | (pass/fix)         │                                     │   │
+          v                    │                                     │   │
+      [act_node]  Step 2      │                                     │   │
+          |                    │                                     │   │
+          v                    │                                     │   │
+      [observe_node]  Step 3  │                                     │   │
+          |                    │                                     │   │
+          v                    │                                     │   │
+      [act_observe_check_node] Step 4                                │   │
+          |                    │                                     │   │
+          | (pass)             │                                     │   │
+          v                    │                                     │   │
+      [observe_think_check_node] Step 5                              │   │
+          |                    │                                     │   │
+          | (pass/purify)      │                                     │   │
+          v                    v                                     │   │
+      [repair_node]  Step R1  <─────────────────────────────────────┘   │
+          |                                                             │
+          v                                                             │
+      [replan_node]  Step R2                                            │
+          |                                                             │
+          v (下一轮)                                                     │
+      [think_node] --> ...                                              │
+          |                                                             │
+          v (无 tool_calls)                                              │
+         END                                                            │
 
     违规恢复路由:
-      - think_act_check 违规 -> REPLAN: think_node 重规划
-      - think_act_check 阻断 -> BLOCK: END
-      - act_observe_check 违规 -> think_node 或 END
-      - observe_think_check 污染 -> think_node (带净化数据)
-      - observe_think_check 严重 -> END
+      - think_act_check pass/fix        -> act_node（继续执行）
+      - think_act_check replan/keep     -> repair_node（进入恢复流水线，
+                                          跳过 act/observe/后续检查）
+      - think_act_check block/escalate  -> END（终止）
+
+      - act_observe_check pass          -> observe_think_check_node
+      - act_observe_check replan/keep   -> repair_node（进入恢复流水线，
+                                          跳过 observe_think_check）
+      - act_observe_check block/escalate -> END
+
+      - observe_think_check pass/purify -> repair_node（进入恢复流水线，
+                                          正常通过时为 no-op 透传）
+      - observe_think_check block/escalate -> END
+
+    恢复流水线:
+      repair_node -> replan_node -> think_node（下一轮）
 
     Returns:
         StateGraph: 未编译的图构建器，调用方需自行 .compile()。
     """
     graph = StateGraph(ReCAPState)
 
+    # ── 核心步骤节点 ──
     graph.add_node("think_node", think_node)
     graph.add_node("think_act_check_node", think_act_check_node)
     graph.add_node("act_node", act_node)
-    graph.add_node("act_observe_check_node", act_observe_check_node)
     graph.add_node("observe_node", observe_node)
+    graph.add_node("act_observe_check_node", act_observe_check_node)
     graph.add_node("observe_think_check_node", observe_think_check_node)
 
+    # ── 恢复节点 ──
+    graph.add_node("repair_node", repair_node)
+    graph.add_node("replan_node", replan_node)
+
+    # ── 入口 ──
     graph.add_edge(START, "think_node")
+
+    # ── Think 后路由：有 tool_calls 进入检查流水线，否则结束 ──
     graph.add_conditional_edges(
         "think_node",
         should_continue_after_think,
@@ -225,11 +338,46 @@ def build_recap_graph() -> StateGraph:
             "__end__": END,
         },
     )
-    graph.add_edge("think_act_check_node", "act_node")
+
+    # ── Think→Act 检查后路由 ──
+    graph.add_conditional_edges(
+        "think_act_check_node",
+        route_after_think_act_check,
+        {
+            "act_node": "act_node",
+            "repair_node": "repair_node",
+            "__end__": END,
+        },
+    )
+
+    # ── 正常执行流水线（通过检查时） ──
     graph.add_edge("act_node", "observe_node")
     graph.add_edge("observe_node", "act_observe_check_node")
-    graph.add_edge("act_observe_check_node", "observe_think_check_node")
-    graph.add_edge("observe_think_check_node", "think_node")
+
+    # ── Act→Observe 检查后路由 ──
+    graph.add_conditional_edges(
+        "act_observe_check_node",
+        route_after_act_observe_check,
+        {
+            "observe_think_check_node": "observe_think_check_node",
+            "repair_node": "repair_node",
+            "__end__": END,
+        },
+    )
+
+    # ── Observe→Think 检查后路由 ──
+    graph.add_conditional_edges(
+        "observe_think_check_node",
+        route_after_observe_think_check,
+        {
+            "repair_node": "repair_node",
+            "__end__": END,
+        },
+    )
+
+    # ── 恢复流水线：repair -> replan -> think（下一轮） ──
+    graph.add_edge("repair_node", "replan_node")
+    graph.add_edge("replan_node", "think_node")
 
     return graph
 
