@@ -26,6 +26,7 @@ from recap.schemas import (
 
 from recap.graph import (
     ReCAPState,
+    set_llm,
     think_node,
     act_node,
     observe_node,
@@ -62,6 +63,7 @@ __all__ = [
     "ViolationEntry",
     "LedgerEntry",
     "ReCAPState",
+    "set_llm",
     "think_node",
     "act_node",
     "observe_node",

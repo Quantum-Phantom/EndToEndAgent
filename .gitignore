@@ -11,3 +11,6 @@ wheels/
 
 # LLM configuration
 .env
+
+# Local data store
+retail_db.jsonl

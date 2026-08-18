@@ -1,0 +1,12 @@
+{"_table": "customers", "rows": {"C001": {"name": "Alice Wang", "phone": "555-0101", "email": "alice@example.com", "address": "12 Elm St"}, "C002": {"name": "Bob Chen", "phone": "555-0202", "email": "bob@example.com", "address": "12 Elm St"}}}
+{"_table": "orders", "rows": {"O001": {"customer_id": "C001", "status": "delivered", "sku": "SKU-100", "qty": 1}, "O002": {"customer_id": "C002", "status": "shipped", "sku": "SKU-200", "qty": 2}}}
+{"_table": "inventory", "rows": {"SKU-100": 42, "SKU-200": 7, "SKU-300": 0}}
+{"_table": "customers", "rows": {"C001": {"name": "Alice Wang", "phone": "555-0101", "email": "alice@example.com", "address": "12 Elm St"}, "C002": {"name": "Bob Chen", "phone": "555-0202", "email": "bob@example.com", "address": "12 Elm St"}}}
+{"_table": "orders", "rows": {"O001": {"customer_id": "C001", "status": "delivered", "sku": "SKU-100", "qty": 1}, "O002": {"customer_id": "C002", "status": "shipped", "sku": "SKU-200", "qty": 2}}}
+{"_table": "inventory", "rows": {"SKU-100": 42, "SKU-200": 7, "SKU-300": 0}}
+{"_table": "customers", "rows": {"C001": {"name": "Alice Wang", "phone": "555-0101", "email": "alice@example.com", "address": "12 Elm St"}, "C002": {"name": "Bob Chen", "phone": "555-0202", "email": "bob@example.com", "address": "12 Elm St"}}}
+{"_table": "orders", "rows": {"O001": {"customer_id": "C001", "status": "delivered", "sku": "SKU-100", "qty": 1}, "O002": {"customer_id": "C002", "status": "shipped", "sku": "SKU-200", "qty": 2}}}
+{"_table": "inventory", "rows": {"SKU-100": 42, "SKU-200": 7, "SKU-300": 0}}
+{"_table": "customers", "rows": {"C001": {"name": "Alice Wang", "phone": "555-0101", "email": "alice@example.com", "address": "12 Elm St"}, "C002": {"name": "Bob Chen", "phone": "555-0202", "email": "bob@example.com", "address": "12 Elm St"}}}
+{"_table": "orders", "rows": {"O001": {"customer_id": "C001", "status": "delivered", "sku": "SKU-100", "qty": 1}, "O002": {"customer_id": "C002", "status": "shipped", "sku": "SKU-200", "qty": 2}}}
+{"_table": "inventory", "rows": {"SKU-100": 42, "SKU-200": 7, "SKU-300": 0}}
