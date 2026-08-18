@@ -10,3 +10,8 @@ dependencies = [
     "langchain-openai>=1.4.3",
     "langgraph>=1.2.11",
 ]
+
+[dependency-groups]
+dev = [
+    "vulture>=2.16",
+]
