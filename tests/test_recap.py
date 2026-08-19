@@ -255,5 +255,110 @@ class TestThinkActCheck(unittest.TestCase):
             Constraint(operator=ConstraintOperator.GE, value="x", value_type=ConstraintValueType.EMAIL)
 
 
+class TestMultiRoundFreshIntent(unittest.TestCase):
+    """回归测试：多轮 ReAct 中 think_node 必须每轮解析新证书，不得复用上一轮
+    残留的 current_intent，否则 think->act 检查会用陈旧 proposed_operation
+    与本轮 tool_calls 比对而误拒（stale-state bug，见 output.log）。
+    """
+
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db_path = Path(tmp.name) / "db.jsonl"
+        reset_database(self.db_path)
+        get_database().seed()
+
+    def _cert_text(self, op, authority="user_request"):
+        return (
+            "```json\n"
+            '{"subgoal": "op %s", "proposed_operation": "%s", '
+            '"argument_constraints": {}, "authority_basis": "%s", '
+            '"expected_effect": "effect", "required_evidence": []}\n'
+            "```"
+        ) % (op, op, authority)
+
+    def test_each_round_uses_fresh_certificate(self):
+        import re as _re
+        from langchain_core.messages import AIMessage
+        from recap.graph import build_recap_graph, set_llm
+
+        cert_json = self._cert_text
+
+        class FakeLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                n = self.calls
+                if n == 1:
+                    return AIMessage(
+                        content=cert_json("verify_identity"),
+                        tool_calls=[{"name": "verify_identity",
+                                     "args": {"phone": "555-0101",
+                                              "email": "alice@example.com",
+                                              "order_id": "O001"},
+                                     "id": "tc-1"}],
+                    )
+                if n == 2:
+                    session = "session-x"
+                    for m in reversed(messages):
+                        t = getattr(m, "content", "")
+                        if isinstance(t, str):
+                            mm = _re.search(r"session=(\S+)", t)
+                            if mm:
+                                session = mm.group(1)
+                                break
+                    return AIMessage(
+                        content=cert_json("lookup_order", authority="verified_session"),
+                        tool_calls=[{"name": "lookup_order",
+                                     "args": {"order_id": "O001",
+                                              "session_token": session},
+                                     "id": "tc-2"}],
+                    )
+                if n == 3:
+                    return AIMessage(
+                        content=cert_json("check_inventory"),
+                        tool_calls=[{"name": "check_inventory",
+                                     "args": {"sku": "SKU-100"}, "id": "tc-3"}],
+                    )
+                return AIMessage(content="done", tool_calls=[])
+
+        set_llm(FakeLLM())
+        task = TaskEntry(
+            description="help customer",
+            tools_available=list(TOOLS_BY_NAME),
+            initial_permissions=["verify_identity", "lookup_order", "check_inventory"],
+        )
+        graph = build_recap_graph().compile()
+        chunks = list(graph.stream(
+            {"messages": [("user", "query order O001 and SKU-100")],
+             "task_entry": task},
+            config={"recursion_limit": 50},
+            stream_mode="updates",
+        ))
+
+        # 收集所有 think_act_check 结果与每轮 think_node 写入的证书操作名
+        check_results = []
+        think_ops = []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            for node, update in (chunk or {}).items():
+                if node == "think_node":
+                    ci = (update or {}).get("current_intent")
+                    think_ops.append(ci.proposed_operation if ci else None)
+                elif node == "think_act_check_node":
+                    check_results.extend((update or {}).get("check_results") or [])
+
+        # 三轮 think 应分别解析出三个不同的证书（无陈旧复用）
+        self.assertEqual(think_ops[:3], ["verify_identity", "lookup_order", "check_inventory"])
+        # 所有 think->act 检查均通过（无 R-OP-SCOPE 误拒）
+        self.assertTrue(check_results, "no think_act_check results captured")
+        for cr in check_results:
+            self.assertTrue(cr.passed, f"unexpected rejection: {cr.violations}")
+            self.assertEqual(cr.check_type, "think->act")
+
+
 if __name__ == "__main__":
     unittest.main()

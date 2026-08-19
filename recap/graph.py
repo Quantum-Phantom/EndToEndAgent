@@ -394,11 +394,10 @@ def think_node(state: ReCAPState) -> dict:
         elif isinstance(response, list) and response:
             ai_message = response[-1] if isinstance(response[-1], AIMessage) else None
 
-    # 已有外部注入的证书（结构化输出路径）优先
-    injected = state.get("current_intent")
-    if injected is not None:
-        cert = injected
-    elif ai_message is not None:
+    # 每轮都从本轮 AIMessage 文本解析最新意图证书；不得复用上一轮残留的
+    # current_intent，否则 think->act 检查会用陈旧 proposed_operation 与
+    # 本轮实际 tool_calls 比对，产生误拒（stale-state bug）。
+    if ai_message is not None:
         data = extract_certificate(ai_message.content or "")
         if data is None:
             missing: list[str] = []
