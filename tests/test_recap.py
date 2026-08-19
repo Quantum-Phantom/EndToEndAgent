@@ -21,6 +21,11 @@ from recap.graph import (
 )
 from recap.schemas import (
     ActionEvent,
+    AuthorityBasis,
+    Constraint,
+    ConstraintField,
+    ConstraintOperator,
+    ConstraintValueType,
     DataSource,
     ExecutionStatus,
     IntentCertificate,
@@ -57,7 +62,7 @@ def make_cert(
         subgoal="track the verified customer's order",
         proposed_operation=op,
         argument_constraints=constraints or {},
-        authority_basis=authority,
+        authority_basis=AuthorityBasis(authority),
         expected_effect="read-only order retrieval",
         required_evidence=evidence or [],
     )
@@ -160,7 +165,13 @@ class TestThinkActCheck(unittest.TestCase):
     def test_param_out_of_constraints(self):
         cert = make_cert(
             op="lookup_order",
-            constraints={"order_id": ["O001"]},
+            constraints={
+                ConstraintField.ORDER_ID: Constraint(
+                    operator=ConstraintOperator.IN,
+                    value=["O001"],
+                    value_type=ConstraintValueType.ENUM,
+                )
+            },
         )
         from langchain_core.messages import AIMessage
         ai = AIMessage(
@@ -177,6 +188,71 @@ class TestThinkActCheck(unittest.TestCase):
         result = out["check_results"][0]
         self.assertFalse(result.passed)
         self.assertIn(RecoveryAction.PARAMETER_FIX, result.recovery_actions)
+
+    def test_constraint_in_pass(self):
+        cert = make_cert(
+            op="lookup_order",
+            constraints={
+                ConstraintField.ORDER_ID: Constraint(
+                    operator=ConstraintOperator.IN,
+                    value=["O001", "O002"],
+                    value_type=ConstraintValueType.ENUM,
+                )
+            },
+        )
+        from langchain_core.messages import AIMessage
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"name": "lookup_order", "args": {"order_id": "O001"}, "id": "tc-1"}],
+        )
+        state = {
+            "current_intent": cert,
+            "task_entry": make_task(),
+            "messages": [ai],
+            "ledger_entries": [],
+        }
+        out = think_act_check_node(state)
+        self.assertTrue(out["check_results"][0].passed)
+
+    def test_number_ge_constraint(self):
+        c = Constraint(operator=ConstraintOperator.GE, value=1, value_type=ConstraintValueType.NUMBER)
+        self.assertTrue(c.check(5))
+        self.assertFalse(c.check(0))
+
+    def test_number_ge_constraint_in_cert(self):
+        cert = make_cert(
+            op="check_inventory",
+            constraints={
+                ConstraintField.QTY: Constraint(
+                    operator=ConstraintOperator.LE,
+                    value=0,
+                    value_type=ConstraintValueType.NUMBER,
+                )
+            },
+        )
+        from langchain_core.messages import AIMessage
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"name": "check_inventory", "args": {"qty": 1}, "id": "tc-1"}],
+        )
+        state = {
+            "current_intent": cert,
+            "task_entry": make_task(),
+            "messages": [ai],
+            "ledger_entries": [],
+        }
+        out = think_act_check_node(state)
+        self.assertFalse(out["check_results"][0].passed)
+
+    def test_invalid_constraint_value_type(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            Constraint(operator=ConstraintOperator.IN, value="O001", value_type=ConstraintValueType.ENUM)
+
+    def test_constraint_operator_type_mismatch(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            Constraint(operator=ConstraintOperator.GE, value="x", value_type=ConstraintValueType.EMAIL)
 
 
 if __name__ == "__main__":

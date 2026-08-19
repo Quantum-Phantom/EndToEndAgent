@@ -10,12 +10,14 @@
 
 from __future__ import annotations
 
+import ast
+import re
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Union
+from typing import Any, Literal, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # =============================================================================
@@ -91,6 +93,301 @@ class ObligationStatus(str, Enum):
     FAILED = "failed"
 
 
+class AuthorityBasis(str, Enum):
+    """授权依据——Think 阶段声明工具调用的合法授权来源。
+
+    LLM 必须从此受控词表中选择其一，避免将自由文本授权描述误填导致
+    Think→Act 授权检查（R-AUTH-BASIS）误判。
+    """
+
+    USER_REQUEST = "user_request"
+    COMPANY_POLICY = "policy"
+    SYSTEM_DEFAULT = "system"
+    USER_AUTHORIZATION = "user_authorization"
+    VERIFIED_SESSION = "verified_session"
+
+
+class ConstraintValueType(str, Enum):
+    """约束值类型——argument_constraints 中每条约束的值的受控类型。
+
+    禁止自由字符串（string）：字符串标识符（如 order_id/sku）须用 ENUM
+    显式列举允许值，或用 REGEX 约束其形态。
+    """
+
+    NUMBER = "number"
+    EMAIL = "email"
+    ENUM = "enum"
+    BOOL = "bool"
+
+
+class ConstraintOperator(str, Enum):
+    """约束运算符——按值类型限定可用子集。
+
+    组合合法性由 Constraint 的 model_validator 强制：
+      - number: eq/ne/ge/le/gt/lt/in/not_in/expr
+      - email:  eq/ne/in/not_in/regex
+      - enum:   eq/ne/in/not_in/regex/expr
+      - bool:   eq/ne
+    """
+
+    EQ = "eq"
+    NE = "ne"
+    GE = "ge"
+    LE = "le"
+    GT = "gt"
+    LT = "lt"
+    IN = "in"
+    NOT_IN = "not_in"
+    REGEX = "regex"
+    EXPR = "expr"
+
+
+class ConstraintField(str, Enum):
+    """参数约束键——全局固定有限集合。
+
+    证书中 argument_constraints 的键必须来自此集合；新增工具参数名时须
+    在此登记，从而保证键可静态枚举、可校验，而非任意自由字符串。
+    """
+
+    ORDER_ID = "order_id"
+    SESSION_TOKEN = "session_token"
+    SKU = "sku"
+    PHONE = "phone"
+    EMAIL = "email"
+    REASON = "reason"
+    QTY = "qty"
+    CUSTOMER_ID = "customer_id"
+    STATUS = "status"
+
+
+# =============================================================================
+# 2.0 约束键值对标准 (Constraint)
+# =============================================================================
+
+# value_type -> 允许的 operator 集合
+_CONSTRAINT_OPERATOR_BY_TYPE: dict[ConstraintValueType, frozenset[ConstraintOperator]] = {
+    ConstraintValueType.NUMBER: frozenset({
+        ConstraintOperator.EQ,
+        ConstraintOperator.NE,
+        ConstraintOperator.GE,
+        ConstraintOperator.LE,
+        ConstraintOperator.GT,
+        ConstraintOperator.LT,
+        ConstraintOperator.IN,
+        ConstraintOperator.NOT_IN,
+        ConstraintOperator.EXPR,
+    }),
+    ConstraintValueType.EMAIL: frozenset({
+        ConstraintOperator.EQ,
+        ConstraintOperator.NE,
+        ConstraintOperator.IN,
+        ConstraintOperator.NOT_IN,
+        ConstraintOperator.REGEX,
+    }),
+    ConstraintValueType.ENUM: frozenset({
+        ConstraintOperator.EQ,
+        ConstraintOperator.NE,
+        ConstraintOperator.IN,
+        ConstraintOperator.NOT_IN,
+        ConstraintOperator.REGEX,
+        ConstraintOperator.EXPR,
+    }),
+    ConstraintValueType.BOOL: frozenset({
+        ConstraintOperator.EQ,
+        ConstraintOperator.NE,
+    }),
+}
+
+
+class Constraint(BaseModel):
+    """一条参数约束：{key, operator, value}，其中 key 来自 ConstraintField。
+
+    键值对标准：
+      - key    ∈ ConstraintField（固定有限集合）
+      - value  属于 value_type 指定的受控类型（number/email/enum/bool）
+      - operator ∈ 有限集合，且须与 value_type 合法组合（见
+        _CONSTRAINT_OPERATOR_BY_TYPE，由 model_validator 强制）
+    """
+
+    operator: ConstraintOperator
+    value: Any
+    value_type: ConstraintValueType = ConstraintValueType.ENUM
+    description: str | None = Field(
+        default=None,
+        description="可选说明，帮助 LLM 表达约束意图（非参数值自由文本）",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "Constraint":
+        _validate_constraint_value(self.value_type, self.value)
+        allowed_ops = _CONSTRAINT_OPERATOR_BY_TYPE[self.value_type]
+        if self.operator not in allowed_ops:
+            raise ValueError(
+                f"operator '{self.operator.value}' is not allowed for "
+                f"value_type '{self.value_type.value}' (allowed: "
+                f"{[o.value for o in sorted(allowed_ops, key=lambda o: o.value)]})"
+            )
+        return self
+
+    def check(self, actual: Any) -> bool:
+        """根据 operator 与 value_type 对实际值求值。"""
+        return _eval_constraint(self.operator, self.value_type, self.value, actual)
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_constraint_value(value_type: ConstraintValueType, value: Any) -> None:
+    """校验 value 与其声明的 value_type 一致，错误时抛 ValueError。"""
+    if value_type == ConstraintValueType.NUMBER:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"value_type 'number' requires int/float, got {type(value).__name__}")
+    elif value_type == ConstraintValueType.EMAIL:
+        if not isinstance(value, str) or not _EMAIL_RE.match(value):
+            raise ValueError(f"value_type 'email' requires a valid email string, got {value!r}")
+    elif value_type == ConstraintValueType.ENUM:
+        if isinstance(value, str):
+            raise ValueError(
+                "value_type 'enum' requires an explicit list of allowed values, "
+                f"got a bare string {value!r}"
+            )
+        if not isinstance(value, (list, tuple, set)) or not value:
+            raise ValueError(f"value_type 'enum' requires a non-empty list, got {value!r}")
+    elif value_type == ConstraintValueType.BOOL:
+        if not isinstance(value, bool):
+            raise ValueError(f"value_type 'bool' requires a bool, got {type(value).__name__}")
+    else:
+        raise ValueError(f"unknown value_type {value_type!r}")
+
+
+# 沙箱 EXPR 表达式守卫：仅允许有限 AST 节点类型与内置函数，禁止属性/调用/import。
+_ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BoolOp,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Compare,
+    ast.Name,
+    ast.Constant,
+    ast.Load,
+)
+_ALLOWED_AST_OPS = (
+    ast.And,
+    ast.Or,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Mod,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.USub,
+    ast.UAdd,
+    ast.Not,
+)
+_EXPR_FUNCS: dict[str, Any] = {
+    "len": len,
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "round": round,
+}
+_EXPR_MAX_LEN = 256
+
+
+def _check_expr_ast(node: ast.AST) -> None:
+    """递归校验表达式 AST 仅包含白名单节点/运算符。"""
+    if not isinstance(node, _ALLOWED_AST_NODES):
+        raise ValueError(f"disallowed AST node in constraint expr: {type(node).__name__}")
+    if isinstance(node, (ast.BinOp, ast.BoolOp)):
+        op = node.op
+        if isinstance(node, ast.BinOp):
+            allowed = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod)
+        else:
+            allowed = (ast.And, ast.Or)
+        if not isinstance(op, allowed):
+            raise ValueError(f"disallowed operator in constraint expr: {type(op).__name__}")
+    elif isinstance(node, ast.UnaryOp) and not isinstance(
+        node.op, (ast.USub, ast.UAdd, ast.Not)
+    ):
+        raise ValueError(f"disallowed unary operator: {type(node.op).__name__}")
+    elif isinstance(node, ast.Compare):
+        for op in node.ops:
+            if not isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                raise ValueError(f"disallowed comparator in constraint expr: {type(op).__name__}")
+        for comparator in node.comparators:
+            _check_expr_ast(comparator)
+        _check_expr_ast(node.left)
+        return
+    elif isinstance(node, ast.Name) and node.id.startswith("__"):
+        raise ValueError("double-underscore names are forbidden in constraint expr")
+    for child in ast.iter_child_nodes(node):
+        _check_expr_ast(child)
+
+
+def _eval_expr(expr: str, actual: Any) -> Any:
+    """沙箱化求值毫秒级 Python 表达式，将 actual 绑定为变量 'x'。
+
+    仅允许白名单内建与运算符，禁止属性访问、调用、导入与下划线名，
+    表达式长度受限以规避超时风险。
+    """
+    if not isinstance(expr, str) or len(expr) > _EXPR_MAX_LEN:
+        raise ValueError("constraint expr must be a short string expression")
+    tree = ast.parse(expr, mode="eval")
+    _check_expr_ast(tree)
+    env: dict[str, Any] = dict(_EXPR_FUNCS)
+    env["x"] = actual
+    result = eval(compile(tree, "<constraint-expr>", "eval"), {"__builtins__": {}}, env)  # noqa: S307
+    return result
+
+
+def _eval_constraint(
+    operator: ConstraintOperator,
+    value_type: ConstraintValueType,
+    expected: Any,
+    actual: Any,
+) -> bool:
+    """根据 operator 对实际值求值，返回是否满足约束。"""
+    op = operator
+    if op == ConstraintOperator.IN:
+        return actual in expected
+    if op == ConstraintOperator.NOT_IN:
+        return actual not in expected
+    if op == ConstraintOperator.REGEX:
+        return re.search(str(expected), str(actual)) is not None
+    if op == ConstraintOperator.EXPR:
+        return bool(_eval_expr(str(expected), actual))
+
+    if op == ConstraintOperator.EQ:
+        return actual == expected
+    if op == ConstraintOperator.NE:
+        return actual != expected
+
+    # 数值比较：实际值必须为数值，否则视为不满足
+    if not isinstance(actual, (int, float)) or isinstance(actual, bool):
+        return False
+    expected_num = expected
+    if isinstance(expected_num, bool) or not isinstance(expected_num, (int, float)):
+        return False
+    if op == ConstraintOperator.GE:
+        return actual >= expected_num
+    if op == ConstraintOperator.LE:
+        return actual <= expected_num
+    if op == ConstraintOperator.GT:
+        return actual > expected_num
+    if op == ConstraintOperator.LT:
+        return actual < expected_num
+    raise ValueError(f"unsupported operator {op!r}")
+
+
 # =============================================================================
 # 2.1 公开意图证书 (Public Intent Certificate)
 # =============================================================================
@@ -108,15 +405,20 @@ class IntentCertificate(BaseModel):
     round_num: int = Field(default=0, ge=0, description="当前 ReAct 轮次")
     subgoal: str = Field(..., min_length=1, description="本轮具体子目标")
     proposed_operation: str = Field(..., min_length=1, description="拟执行的工具/动作名称")
-    argument_constraints: dict[str, Any] = Field(
+    argument_constraints: dict[ConstraintField, Constraint] = Field(
         default_factory=dict,
-        description="参数约束：允许的数据范围、操作对象及接收方",
+        description="参数约束（键值对标准）：键来自 ConstraintField，值为 Constraint 对象。"
+        "例如 {\"order_id\": {\"operator\": \"in\", \"value\": [\"O001\"], \"value_type\": \"enum\"}}",
     )
-    authority_basis: str = Field(..., min_length=1, description="授权依据：用户指令或政策凭证")
+    authority_basis: AuthorityBasis = Field(
+        ...,
+        description="授权依据（受控词表）："
+        + " / ".join(a.value for a in AuthorityBasis),
+    )
     expected_effect: str = Field(..., min_length=1, description="预期效果：允许和禁止的状态变化")
     required_evidence: list[str] = Field(
         default_factory=list,
-        description="执行后必须获得的回执或来源证明",
+        description="执行后必须获得的回执或来源证明（如 delivery_receipt、state_diff）",
     )
 
     @field_validator("required_evidence")
@@ -209,7 +511,11 @@ class ViolationEvidence(BaseModel):
     violation_type: ViolationType
     rule_id: str = Field(..., min_length=1, description="被违反的规则编号")
     rule_description: str = Field(..., min_length=1)
-    intent_field: str | None = Field(default=None, description="关联的意图证书字段")
+    intent_field: str | None = Field(
+        default=None,
+        description="关联的意图证书字段名（subgoal/proposed_operation/argument_constraints/"
+        "authority_basis/expected_effect/required_evidence）",
+    )
     expected_value: Any = Field(default=None, description="期望值（来自证书/策略）")
     actual_value: Any = Field(default=None, description="实际值（来自工具调用/返回）")
     decision: RecoveryAction = Field(default=RecoveryAction.BLOCK)
@@ -244,9 +550,8 @@ class TransitionResult(BaseModel):
     """阶段转换检查的统一返回结构。"""
 
     passed: bool
-    check_type: str = Field(
+    check_type: Literal["think->act", "act->observe", "observe->think"] = Field(
         ...,
-        pattern=r"^(think->act|act->observe|observe->think)$",
         description="检查类型：think->act / act->observe / observe->think",
     )
     violations: list[ViolationEvidence] = Field(default_factory=list)
@@ -287,7 +592,7 @@ class TransitionResult(BaseModel):
 class TaskEntry(BaseModel):
     """任务定义条目——初始化时写入账本。"""
 
-    entry_type: str = Field(default="task", frozen=True)
+    entry_type: Literal["task"] = Field(default="task", frozen=True)
     task_id: str = Field(default_factory=lambda: f"task-{uuid.uuid4().hex[:12]}")
     description: str = Field(..., min_length=1, description="用户原始任务描述")
     policies: list[str] = Field(default_factory=list, description="适用的安全策略 ID 列表")
@@ -299,7 +604,7 @@ class TaskEntry(BaseModel):
 class IntentEntry(BaseModel):
     """意图条目——Think 阶段提交证书后写入账本。"""
 
-    entry_type: str = Field(default="intent", frozen=True)
+    entry_type: Literal["intent"] = Field(default="intent", frozen=True)
     certificate: IntentCertificate
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -307,7 +612,7 @@ class IntentEntry(BaseModel):
 class ActionEntry(BaseModel):
     """动作条目——工具调用执行前后写入账本。"""
 
-    entry_type: str = Field(default="action", frozen=True)
+    entry_type: Literal["action"] = Field(default="action", frozen=True)
     action: ActionEvent
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -315,7 +620,7 @@ class ActionEntry(BaseModel):
 class ObservationEntry(BaseModel):
     """观测条目——环境返回结果后写入账本。"""
 
-    entry_type: str = Field(default="observation", frozen=True)
+    entry_type: Literal["observation"] = Field(default="observation", frozen=True)
     observation: ObservationEvent
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -323,7 +628,7 @@ class ObservationEntry(BaseModel):
 class ObligationEntry(BaseModel):
     """证据义务条目——跟踪未完成的证据义务。"""
 
-    entry_type: str = Field(default="obligation", frozen=True)
+    entry_type: Literal["obligation"] = Field(default="obligation", frozen=True)
     obligation_id: str = Field(default_factory=lambda: f"obl-{uuid.uuid4().hex[:12]}")
     description: str = Field(..., min_length=1)
     status: ObligationStatus = Field(default=ObligationStatus.PENDING)
@@ -335,7 +640,7 @@ class ObligationEntry(BaseModel):
 class ViolationEntry(BaseModel):
     """违规条目——检测到违规时追加写入账本。"""
 
-    entry_type: str = Field(default="violation", frozen=True)
+    entry_type: Literal["violation"] = Field(default="violation", frozen=True)
     violation: ViolationEvidence
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

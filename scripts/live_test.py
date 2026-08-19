@@ -16,6 +16,10 @@ import os
 import sys
 from pathlib import Path
 
+if os.name == "nt":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -96,27 +100,28 @@ def main() -> int:
     print("=" * 70)
 
     config = {"recursion_limit": 50}
-    result = None
+    # result = None
     last_snapshot: dict | None = None
     try:
-        from collections import Counter
-
         for chunk in graph.stream(
             {
                 "messages": [("user", user_request)],
                 "task_entry": task,
             },
             config=config,
-            stream_mode="values",
+            stream_mode="updates",
         ):
+            if not isinstance(chunk, dict):
+                continue
             last_snapshot = chunk
-            for m in chunk.get("messages", []):
-                role = getattr(m, "type", type(m).__name__)
-                content = getattr(m, "content", "")
-                if isinstance(content, list):
-                    content = " ".join(str(c) for c in content)
-                print(f"[{role}] {str(content)[:300]}")
-        result = graph.get_state(config).values
+            for node, update in chunk.items():
+                for m in ((update or {}).get("messages") or []):
+                    role = getattr(m, "type", type(m).__name__)
+                    content = getattr(m, "content", "")
+                    if isinstance(content, list):
+                        content = " ".join(str(c) for c in content)
+                    print(f"[{node}] [{role}] {str(content)}")
+        # result = graph.get_state(config).values
     except Exception as e:
         print(f"\n[错误] 图执行失败: {type(e).__name__}: {e}")
         print("--- 出错前已累积的输出 ---")
@@ -125,27 +130,28 @@ def main() -> int:
                 last_snapshot = graph.get_state(config).values
             except Exception:
                 last_snapshot = None
-        _print_state(last_snapshot)
+        _print_state(last_snapshot, include_messages=True)
         raise
 
-    _print_state(result) if result is not None else None
+    # _print_state(result) if result is not None else None
     return 0
 
 
-def _print_state(state: dict | None) -> None:
-    """打印一轮结束后的完整状态：消息、账本、检查结果。"""
+def _print_state(state: dict | None, include_messages: bool = False) -> None:
+    """打印一轮结束后的完整状态：可选的账本、检查结果；消息通常已在流式循环中打印。"""
     if state is None:
         print("(无可用状态)")
         return
     from collections import Counter
 
-    print("\n--- 消息 ---")
-    for m in state.get("messages", []):
-        role = getattr(m, "type", type(m).__name__)
-        content = getattr(m, "content", "")
-        if isinstance(content, list):
-            content = " ".join(str(c) for c in content)
-        print(f"[{role}] {str(content)[:300]}")
+    if include_messages:
+        print("\n--- 消息 ---")
+        for m in state.get("messages", []):
+            role = getattr(m, "type", type(m).__name__)
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                content = " ".join(str(c) for c in content)
+            print(f"[{role}] {str(content)}")
 
     print("\n--- 账本条目录 ---")
     print(Counter(e.entry_type for e in state.get("ledger_entries", [])))

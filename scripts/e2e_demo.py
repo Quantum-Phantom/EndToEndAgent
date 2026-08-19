@@ -28,7 +28,7 @@ def main():
     cert_json = (
         '{"subgoal": "track verified customer order", '
         '"proposed_operation": "verify_identity", '
-        '"argument_constraints": {"order_id": ["O001"]}, '
+        '"argument_constraints": {"order_id": {"operator": "in", "value": ["O001"], "value_type": "enum"}}, '
         '"authority_basis": "verified_session", '
         '"expected_effect": "identity session created", '
         '"required_evidence": []}'

@@ -107,14 +107,20 @@ ReCAP 作为外部运行时层插入 ReAct 循环，无需修改大模型参数�
     "subgoal": "将审计报告发送给内部审计部门",
     "proposed_operation": "send_email",
     "argument_constraints": {
-        "recipient_domain": "company.internal",
-        "attachment": "audit_report.pdf"
+        "recipient": {"operator": "eq", "value": "audit@company.internal", "value_type": "email"},
+        "attachment": {"operator": "in", "value": ["audit_report.pdf"], "value_type": "enum"}
     },
     "authority_basis": "user_request",
     "expected_effect": "新增一封内部邮件",
     "required_evidence": ["delivery_receipt"]
 }
 ```
+
+`argument_constraints` 采用**键值对标准**：键来自固定有限集合（`ConstraintField`，如 `order_id` / `recipient` / `attachment`），值为一条 `Constraint` 对象 `{"operator", "value", "value_type"}`。其中：
+
+- `value_type` 仅限 `number` / `email` / `enum` / `bool`（禁止自由字符串——字符串标识符须用 `enum` 显式列举）；
+- `operator` 仅限 `eq` / `ne` / `ge` / `le` / `gt` / `lt` / `in` / `not_in` / `regex` / `expr`，且受 `value_type` 限定合法组合（数值比较仅用于 `number`，集合包含与正则用于 `email`/`enum`，沙箱表达式 `expr` 用于复杂条件）。
+- `authority_basis` 受控词表：`user_request` / `policy` / `system` / `user_authorization` / `verified_session`。
 
 适配器先解析并校验证书，再决定是否允许随后的工具调用。证书解析失败、关键字段缺失或语义抽取置信度过低时，系统要求 Agent 补充信息或重新规划，而不是默认放行。
 
