@@ -14,10 +14,11 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 from recap.agent.graph import compile_recap_graph
-from recap.ledger import InMemoryLedgerRepository, LedgerService
+from recap.approval import HumanApprovalService
+from recap.contracts import ContractPipeline
+from recap.ledger import LedgerService, build_ledger_repository
 from recap.nodes.think import build_think_node
-from recap.tools import ToolRegistry
-from recap.tools.arithmetic import ARITHMETIC_TOOLS
+from recap.tools import ALL_TOOLS, TOOL_CAPABILITIES, ToolRegistry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -61,6 +62,10 @@ def build_real_runtime(
     timeout_seconds: float = 60.0,
     max_retries: int = 2,
     tool_timeout_seconds: float = 30.0,
+    ledger_backend: str | None = None,
+    sqlite_path: str | Path | None = None,
+    postgres_dsn: str | None = None,
+    approval_service: HumanApprovalService | None = None,
 ):
     """构建真实 LLM、Ledger、工具注册表和已编译 ReCAP Graph。"""
 
@@ -78,15 +83,34 @@ def build_real_runtime(
 
     llm = ChatOpenAI(**llm_kwargs)
 
-    ledger = LedgerService(InMemoryLedgerRepository())
+    selected_backend = ledger_backend or os.getenv("RECAP_LEDGER_BACKEND", "memory")
+    selected_sqlite_path = (
+        sqlite_path
+        or os.getenv("RECAP_SQLITE_PATH")
+        or PROJECT_ROOT / "data" / "recap-ledger.sqlite3"
+    )
+    selected_postgres_dsn = postgres_dsn or os.getenv("RECAP_POSTGRES_DSN")
+    repository = build_ledger_repository(
+        selected_backend,
+        sqlite_path=selected_sqlite_path,
+        postgres_dsn=selected_postgres_dsn,
+    )
+    ledger = LedgerService(repository)
     registry = ToolRegistry()
-    for tool in ARITHMETIC_TOOLS:
-        registry.register(tool)
+    pipeline = ContractPipeline()
+
+    for tool in ALL_TOOLS:
+        capability = TOOL_CAPABILITIES.get(tool.name)
+        if capability is None:
+            raise RuntimeError(f"Tool has no declared ToolCapability: {tool.name}")
+        registry.register(tool, capability)
 
     think_node = build_think_node(
         llm=llm,
         ledger=ledger,
-        tools=ARITHMETIC_TOOLS,
+        tools=ALL_TOOLS,
+        pipeline=pipeline,
+        capabilities=TOOL_CAPABILITIES,
     )
 
     graph = compile_recap_graph(
@@ -94,6 +118,8 @@ def build_real_runtime(
         ledger=ledger,
         registry=registry,
         tool_timeout_seconds=tool_timeout_seconds,
+        contract_pipeline=pipeline,
+        approval_service=approval_service,
     )
 
     return graph, ledger, registry

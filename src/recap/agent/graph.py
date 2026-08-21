@@ -8,44 +8,39 @@ from typing import Any, Literal, TypeAlias
 from langgraph.graph import END, START, StateGraph
 
 from recap.agent.state import ReCAPState
+from recap.approval import HumanApprovalService
+from recap.contracts import ContractPipeline
 from recap.ledger import LedgerService
 from recap.nodes import (
     build_act_node,
     build_act_observe_check_node,
     build_observe_node,
+    build_observe_think_check_node,
     build_think_act_check_node,
+    build_human_approval_node,
     route_after_act,
     route_after_act_observe,
+    route_after_observe_think,
     route_after_think_act,
+    route_after_human_approval,
 )
 from recap.tools import ToolRegistry
 
-
 NodeUpdate: TypeAlias = dict[str, Any]
-
-ThinkNode: TypeAlias = Callable[
-    [ReCAPState],
-    NodeUpdate | Awaitable[NodeUpdate],
-]
-
-AfterThinkRoute: TypeAlias = Literal[
-    "think_act_check_node",
-    "__end__",
-]
+ThinkNode: TypeAlias = Callable[[ReCAPState], NodeUpdate | Awaitable[NodeUpdate]]
+AfterThinkRoute: TypeAlias = Literal["think_act_check_node", "__end__"]
 
 
-def route_after_think(
-    state: ReCAPState,
-) -> AfterThinkRoute:
-    """只有同时存在候选调用和合同时才进入 Think→Act 检查。"""
-
+def route_after_think(state: ReCAPState) -> AfterThinkRoute:
     candidate = state.get("candidate_tool_call")
     contract = state.get("current_contract")
-
     if candidate is None or contract is None:
         return "__end__"
-
     return "think_act_check_node"
+
+
+def route_from_start(state: ReCAPState) -> Literal["think_node", "human_approval_node"]:
+    return "human_approval_node" if state.get("awaiting_approval") else "think_node"
 
 
 def build_recap_graph(
@@ -54,112 +49,91 @@ def build_recap_graph(
     ledger: LedgerService,
     registry: ToolRegistry,
     tool_timeout_seconds: float = 30.0,
+    contract_pipeline: ContractPipeline | None = None,
+    approval_service: HumanApprovalService | None = None,
 ) -> StateGraph:
-    """构建尚未编译的 ReCAP LangGraph。"""
-
     if tool_timeout_seconds <= 0:
-        raise ValueError(
-            "tool_timeout_seconds must be greater than zero"
-        )
+        raise ValueError("tool_timeout_seconds must be greater than zero")
 
-    think_act_check_node = build_think_act_check_node(
-        ledger
-    )
-
-    act_node = build_act_node(
-        ledger,
-        registry,
-        timeout_seconds=tool_timeout_seconds,
-    )
-
-    observe_node = build_observe_node(
-        ledger
-    )
-
-    act_observe_check_node = (
-        build_act_observe_check_node(ledger)
+    pipeline = contract_pipeline or ContractPipeline()
+    think_act_check_node = build_think_act_check_node(ledger, pipeline, registry)
+    act_node = build_act_node(ledger, registry, timeout_seconds=tool_timeout_seconds)
+    observe_node = build_observe_node(ledger)
+    act_observe_check_node = build_act_observe_check_node(ledger, pipeline)
+    observe_think_check_node = build_observe_think_check_node(ledger, pipeline)
+    human_approval_node = build_human_approval_node(
+        ledger, approval_service or HumanApprovalService()
     )
 
     graph = StateGraph(ReCAPState)
-
-    graph.add_node(
-        "think_node",
-        think_node,
-    )
-    graph.add_node(
-        "think_act_check_node",
-        think_act_check_node,
-    )
-    graph.add_node(
-        "act_node",
-        act_node,
-    )
-    graph.add_node(
-        "observe_node",
-        observe_node,
-    )
-    graph.add_node(
-        "act_observe_check_node",
-        act_observe_check_node,
-    )
-
-    graph.add_edge(
+    graph.add_node("think_node", think_node)
+    graph.add_node("think_act_check_node", think_act_check_node)
+    graph.add_node("act_node", act_node)
+    graph.add_node("observe_node", observe_node)
+    graph.add_node("act_observe_check_node", act_observe_check_node)
+    graph.add_node("observe_think_check_node", observe_think_check_node)
+    graph.add_node("human_approval_node", human_approval_node)
+    graph.add_conditional_edges(
         START,
-        "think_node",
+        route_from_start,
+        {"think_node": "think_node", "human_approval_node": "human_approval_node"},
     )
-
     graph.add_conditional_edges(
         "think_node",
         route_after_think,
         {
-            "think_act_check_node": (
-                "think_act_check_node"
-            ),
+            "think_act_check_node": "think_act_check_node",
             "__end__": END,
         },
     )
-
-    # 只有 Think→Act 检查明确批准后，
-    # 才允许进入 act_node。
     graph.add_conditional_edges(
         "think_act_check_node",
         route_after_think_act,
         {
             "act": "act_node",
             "replan": "think_node",
-            "human_approval": END,
+            "human_approval": "human_approval_node",
             "end": END,
         },
     )
-
-    # 只有成功执行的动作才能进入 Observe。
     graph.add_conditional_edges(
         "act_node",
         route_after_act,
         {
             "observe": "observe_node",
             "replan": "think_node",
-            "human_approval": END,
+            "human_approval": "human_approval_node",
             "end": END,
         },
     )
 
-    # Observation 必须经过证据检查，不能直接结束。
-    graph.add_edge(
-        "observe_node",
-        "act_observe_check_node",
-    )
-
+    # Observation can no longer terminate the graph without evidence checking.
+    graph.add_edge("observe_node", "act_observe_check_node")
     graph.add_conditional_edges(
         "act_observe_check_node",
         route_after_act_observe,
         {
+            "observe_think": "observe_think_check_node",
             "replan": "think_node",
-            "human_approval": END,
+            "human_approval": "human_approval_node",
             "end": END,
         },
     )
-
+    graph.add_conditional_edges(
+        "observe_think_check_node",
+        route_after_observe_think,
+        {
+            "think": "think_node",
+            "replan": "think_node",
+            "human_approval": "human_approval_node",
+            "end": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "human_approval_node",
+        route_after_human_approval,
+        {"replan": "think_node", "end": END},
+    )
     return graph
 
 
@@ -170,18 +144,14 @@ def compile_recap_graph(
     registry: ToolRegistry,
     tool_timeout_seconds: float = 30.0,
     checkpointer: Any = None,
+    contract_pipeline: ContractPipeline | None = None,
+    approval_service: HumanApprovalService | None = None,
 ):
-    """构建并编译 ReCAP LangGraph。"""
-
-    builder = build_recap_graph(
+    return build_recap_graph(
         think_node=think_node,
         ledger=ledger,
         registry=registry,
-        tool_timeout_seconds=(
-            tool_timeout_seconds
-        ),
-    )
-
-    return builder.compile(
-        checkpointer=checkpointer
-    )
+        tool_timeout_seconds=tool_timeout_seconds,
+        contract_pipeline=contract_pipeline,
+        approval_service=approval_service,
+    ).compile(checkpointer=checkpointer)

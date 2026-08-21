@@ -68,46 +68,50 @@ def executing_state(*, evidence: list[str], observation_call_id: str = "call-001
 
 
 @pytest.mark.asyncio
-async def test_complete_evidence_fulfills_contract(ledger, repository):
+async def test_complete_evidence_advances_to_observe_think(ledger, repository):
     state = executing_state(evidence=["tool_return", "call_id_binding"])
     update = await build_act_observe_check_node(ledger)(state)
     events = await repository.list_events(TASK_ID, THREAD_ID)
 
-    assert update["current_contract"].status == ContractStatus.FULFILLED
+    assert update["current_contract"].status == ContractStatus.EVIDENCE_PENDING
     assert update["current_observation"].is_complete is True
     assert update["pending_obligations"] == []
-    assert update["final_answer_allowed"] is True
+    assert update["final_answer_allowed"] is False
     assert update["check_results"][0].passed is True
-    assert update["next_route"] == "end"
+    assert update["next_route"] == "observe_think"
     assert [event.event_type for event in events] == [
         LedgerEventType.CONTRACT_EVIDENCE_PENDING,
         LedgerEventType.OBLIGATION_FULFILLED,
-        LedgerEventType.CONTRACT_FULFILLED,
     ]
     assert await ledger.verify_chain(TASK_ID, THREAD_ID) is True
 
 
 @pytest.mark.asyncio
-async def test_missing_tool_return_blocks_contract(ledger, repository):
+async def test_missing_tool_return_keeps_contract_pending(ledger, repository):
     state = executing_state(evidence=["call_id_binding"])
     update = await build_act_observe_check_node(ledger)(state)
     events = await repository.list_events(TASK_ID, THREAD_ID)
 
-    assert update["current_contract"].status == ContractStatus.BLOCKED
+    assert update["current_contract"].status == ContractStatus.EVIDENCE_PENDING
+    assert update["pending_obligations"] == ["tool_return"]
+    assert update["next_route"] == "replan"
+    assert route_after_act_observe({**state, **update}) == "replan"
     assert update["check_results"][0].violations[0].rule_id == "A2O-EVIDENCE-001"
     assert update["final_answer_allowed"] is False
     assert [event.event_type for event in events] == [
         LedgerEventType.VIOLATION_DETECTED,
-        LedgerEventType.CONTRACT_BLOCKED,
+        LedgerEventType.CONTRACT_EVIDENCE_PENDING,
+        LedgerEventType.OBLIGATION_CREATED,
     ]
 
 
 @pytest.mark.asyncio
-async def test_missing_call_id_binding_blocks_contract(ledger):
+async def test_missing_call_id_binding_keeps_contract_pending(ledger):
     state = executing_state(evidence=["tool_return"])
     update = await build_act_observe_check_node(ledger)(state)
 
-    assert update["current_contract"].status == ContractStatus.BLOCKED
+    assert update["current_contract"].status == ContractStatus.EVIDENCE_PENDING
+    assert update["pending_obligations"] == ["call_id_binding"]
     violation = update["check_results"][0].violations[0]
     assert violation.rule_id == "A2O-EVIDENCE-001"
     assert "call_id_binding" in violation.actual_value["missing"]
@@ -126,6 +130,36 @@ async def test_mismatched_call_id_blocks_contract(ledger):
 
 
 @pytest.mark.asyncio
+async def test_forbidden_observed_effect_blocks_contract(ledger):
+    state = executing_state(evidence=["tool_return", "call_id_binding"])
+    state["current_contract"] = state["current_contract"].model_copy(
+        update={"forbidden_effects": ["file_write"]}
+    )
+    state["current_observation"] = state["current_observation"].model_copy(
+        update={"observed_effects": ["file_write"]}
+    )
+
+    update = await build_act_observe_check_node(ledger)(state)
+
+    assert update["current_contract"].status == ContractStatus.BLOCKED
+    assert update["check_results"][0].violations[0].rule_id == "A2O-EFFECT-BOUNDARY-001"
+
+
+@pytest.mark.asyncio
+async def test_missing_required_effect_stays_pending(ledger):
+    state = executing_state(evidence=["tool_return", "call_id_binding"])
+    state["current_contract"] = state["current_contract"].model_copy(
+        update={"required_effects": ["delivery_receipt"]}
+    )
+
+    update = await build_act_observe_check_node(ledger)(state)
+
+    assert update["current_contract"].status == ContractStatus.EVIDENCE_PENDING
+    assert update["pending_obligations"] == ["effect:delivery_receipt"]
+    assert update["final_answer_allowed"] is False
+
+
+@pytest.mark.asyncio
 async def test_verifier_does_not_mutate_input_contract(ledger):
     state = executing_state(evidence=["tool_return", "call_id_binding"])
     original = state["current_contract"]
@@ -133,7 +167,7 @@ async def test_verifier_does_not_mutate_input_contract(ledger):
 
     assert original.status == ContractStatus.EXECUTING
     assert update["current_contract"] is not original
-    assert update["current_contract"].status == ContractStatus.FULFILLED
+    assert update["current_contract"].status == ContractStatus.EVIDENCE_PENDING
 
 
 def test_route_after_act_observe_fails_closed():

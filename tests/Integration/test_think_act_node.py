@@ -123,13 +123,14 @@ async def test_disallowed_tool_is_blocked_and_never_approved(
     event_types = [event.event_type for event in events]
 
     assert update["current_contract"].status == ContractStatus.BLOCKED
-    assert update["next_route"] == "end"
+    assert update["next_route"] == "replan"
     assert update["check_results"][0].passed is False
     assert update["check_results"][0].next_allowed is False
-    assert route_after_think_act(routed_state) == "end"
+    assert route_after_think_act(routed_state) == "replan"
     assert event_types == [
         LedgerEventType.CONTRACT_CREATED,
         LedgerEventType.VIOLATION_DETECTED,
+        LedgerEventType.ACTION_BLOCKED,
         LedgerEventType.CONTRACT_BLOCKED,
     ]
     assert LedgerEventType.ACTION_APPROVED not in event_types
@@ -152,7 +153,7 @@ async def test_argument_mismatch_is_blocked(
     events = await repository.list_events(TASK_ID, THREAD_ID)
 
     assert update["current_contract"].status == ContractStatus.BLOCKED
-    assert update["next_route"] == "end"
+    assert update["next_route"] == "replan"
     violation = update["check_results"][0].violations[0]
     assert violation.rule_id == "CONTRACT-ARGS-001"
     assert violation.actual_value["args"] == {"a": 3, "b": 40}
@@ -219,7 +220,7 @@ async def test_langgraph_does_not_enter_act_node_for_disallowed_tool(
     event_types = [event.event_type for event in events]
 
     assert calls["act_node"] == 0
-    assert final_state["next_route"] == "end"
+    assert final_state["next_route"] == "replan"
     assert final_state["current_contract"].status == ContractStatus.BLOCKED
     assert LedgerEventType.VIOLATION_DETECTED in event_types
     assert LedgerEventType.ACTION_APPROVED not in event_types

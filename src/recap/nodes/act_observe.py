@@ -6,10 +6,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from recap.agent.state import ReCAPState
-from recap.contracts import ContractStatus, RuntimeContract
+from recap.contracts import ContractPipeline, ContractStatus, RuntimeContract
 from recap.integration import record_violation, transition_contract_and_record
 from recap.ledger import LedgerEvent, LedgerEventType, LedgerService
+from recap.recovery import route_for_recovery
 from recap.schemas import (
+    DataSource,
     ExecutionStatus,
     ObservationEvent,
     RecoveryAction,
@@ -19,7 +21,7 @@ from recap.schemas import (
 )
 
 ActObserveNode = Callable[[ReCAPState], Awaitable[dict[str, Any]]]
-AfterActObserveRoute = Literal["replan", "human_approval", "end"]
+AfterActObserveRoute = Literal["observe_think", "replan", "human_approval", "end"]
 
 
 def _thread_id(state: ReCAPState) -> str:
@@ -34,6 +36,7 @@ def _violation(
     intent_field: str,
     expected: Any,
     actual: Any,
+    decision: RecoveryAction = RecoveryAction.BLOCK,
 ) -> ViolationEvidence:
     return ViolationEvidence(
         violation_type=violation_type,
@@ -42,7 +45,7 @@ def _violation(
         intent_field=intent_field,
         expected_value=expected,
         actual_value=actual,
-        decision=RecoveryAction.BLOCK,
+        decision=decision,
         evidence_chain=[
             f"rule={rule_id}",
             f"expected={expected!r}",
@@ -79,7 +82,7 @@ async def _block_contract(
             "ledger_events": [violation_event],
             "ledger_head_hash": violation_event.event_hash,
             "pending_obligations": list(contract.required_evidence),
-            "next_route": "end",
+            "next_route": route_for_recovery(violation.decision),
             "final_answer_allowed": False,
         }
     blocked_contract, blocked_event = await transition_contract_and_record(
@@ -106,8 +109,78 @@ async def _block_contract(
     }
 
 
-def build_act_observe_check_node(ledger: LedgerService) -> ActObserveNode:
+async def _keep_evidence_pending(
+    *,
+    ledger: LedgerService,
+    contract: RuntimeContract,
+    state: ReCAPState,
+    observation: ObservationEvent,
+    violation: ViolationEvidence,
+    missing: set[str],
+) -> dict[str, Any]:
+    violation_event = await record_violation(
+        ledger=ledger,
+        contract=contract,
+        thread_id=_thread_id(state),
+        actor="act_observe_check_node",
+        violation_payload=violation.model_dump(mode="json"),
+    )
+    pending_contract, pending_event = await transition_contract_and_record(
+        ledger=ledger,
+        contract=contract,
+        thread_id=_thread_id(state),
+        target=ContractStatus.EVIDENCE_PENDING,
+        event_type=LedgerEventType.CONTRACT_EVIDENCE_PENDING,
+        actor="act_observe_check_node",
+        details={"missing": sorted(missing)},
+    )
+    obligation_event = await ledger.record(
+        event_type=LedgerEventType.OBLIGATION_CREATED,
+        task_id=pending_contract.task_id,
+        thread_id=_thread_id(state),
+        round_num=pending_contract.round_num,
+        contract_id=pending_contract.contract_id,
+        actor="act_observe_check_node",
+        payload={"status": "pending", "missing": sorted(missing)},
+    )
+    check = TransitionResult.blocked(
+        "act->observe", [violation], [RecoveryAction.KEEP_UNFINISHED]
+    )
+    return {
+        "current_contract": pending_contract,
+        "current_observation": observation.model_copy(update={"is_complete": False}),
+        "check_results": [check],
+        "ledger_events": [violation_event, pending_event, obligation_event],
+        "ledger_head_hash": obligation_event.event_hash,
+        "pending_obligations": sorted(missing),
+        "round_summaries": [
+            {
+                "round_num": pending_contract.round_num,
+                "contract_id": pending_contract.contract_id,
+                "status": pending_contract.status.value,
+                "tool_name": pending_contract.certificate.proposed_operation,
+                "subgoal": pending_contract.certificate.subgoal,
+                "pending_obligations": sorted(missing),
+                "result": (
+                    observation.return_content
+                    if observation.data_source != DataSource.EXTERNAL
+                    else None
+                ),
+            }
+        ],
+        "next_route": route_for_recovery(violation.decision),
+        "task_completed": False,
+        "final_answer_allowed": False,
+    }
+
+
+def build_act_observe_check_node(
+    ledger: LedgerService,
+    pipeline: ContractPipeline | None = None,
+) -> ActObserveNode:
     """Build a verifier that binds observations and settles evidence obligations."""
+
+    pipeline = pipeline or ContractPipeline()
 
     async def act_observe_check_node(state: ReCAPState) -> dict[str, Any]:
         contract = state.get("current_contract")
@@ -126,7 +199,7 @@ def build_act_observe_check_node(ledger: LedgerService) -> ActObserveNode:
             )
             return {
                 "check_results": [TransitionResult.blocked("act->observe", [violation])],
-                "next_route": "end",
+        "next_route": route_for_recovery(RecoveryAction.KEEP_UNFINISHED),
                 "final_answer_allowed": False,
             }
 
@@ -182,22 +255,110 @@ def build_act_observe_check_node(ledger: LedgerService) -> ActObserveNode:
                 ledger=ledger, contract=contract, state=state, violation=violation
             )
 
-        missing = contract.missing_evidence(observation.evidence_collected)
-        if missing:
+        result = state.get("raw_tool_result")
+        evidence_bundle = (
+            pipeline.adapt_evidence(result, action, observation)
+            if result is not None
+            else None
+        )
+        if evidence_bundle is not None and not evidence_bundle.valid_binding:
             violation = _violation(
-                violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
-                rule_id="A2O-EVIDENCE-001",
-                description="Contract evidence obligations are incomplete",
-                intent_field="required_evidence",
-                expected=sorted(contract.required_evidence),
+                violation_type=ViolationType.ACTION_VIOLATION,
+                rule_id="A2O-TOOL-BINDING-001",
+                description="Trusted result must match action call_id, tool and parameters",
+                intent_field="action_binding",
+                expected={
+                    "call_id": action.call_id,
+                    "tool_name": action.tool_name,
+                    "args": action.actual_params,
+                },
+                actual={"binding_errors": evidence_bundle.binding_errors},
+            )
+            return await _block_contract(
+                ledger=ledger, contract=contract, state=state, violation=violation
+            )
+
+        observed_effects = set(observation.observed_effects)
+        semantic_effects = observed_effects - {"tool_return", "call_id_binding"}
+        forbidden = semantic_effects & set(contract.forbidden_effects)
+        unexpected = (
+            semantic_effects
+            - set(contract.allowed_effects)
+            - set(contract.required_effects)
+            if contract.allowed_effects
+            else set()
+        )
+        if forbidden or unexpected:
+            violation = _violation(
+                violation_type=ViolationType.ACTION_VIOLATION,
+                rule_id="A2O-EFFECT-BOUNDARY-001",
+                description="Observed effects violate the contract effect boundary",
+                intent_field="allowed_effects/forbidden_effects",
+                expected={
+                    "allowed": sorted(contract.allowed_effects),
+                    "forbidden": sorted(contract.forbidden_effects),
+                },
                 actual={
-                    "collected": sorted(observation.evidence_collected),
-                    "missing": sorted(missing),
+                    "observed": sorted(semantic_effects),
+                    "forbidden": sorted(forbidden),
+                    "unexpected": sorted(unexpected),
                 },
             )
             return await _block_contract(
                 ledger=ledger, contract=contract, state=state, violation=violation
             )
+
+        pipeline.open_obligations(contract)
+        if evidence_bundle is not None:
+            pipeline.settle_obligations(contract.task_id, evidence_bundle)
+            pending = pipeline.obligation_manager.pending(contract.task_id)
+            missing = {
+                item.requirement if item.kind == "evidence" else f"effect:{item.requirement}"
+                for item in pending
+            }
+        else:
+            missing_evidence = contract.missing_evidence(observation.evidence_collected)
+            missing_effects = set(contract.required_effects) - semantic_effects
+            missing = set(missing_evidence) | {
+                f"effect:{effect}" for effect in missing_effects
+            }
+        if missing:
+            violation = _violation(
+                violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
+                rule_id="A2O-EVIDENCE-001",
+                description="Contract effects or evidence obligations are incomplete",
+                intent_field="required_effects/required_evidence",
+                expected={
+                    "effects": sorted(contract.required_effects),
+                    "evidence": sorted(contract.required_evidence),
+                },
+                actual={
+                    "observed_effects": sorted(semantic_effects),
+                    "collected": sorted(observation.evidence_collected),
+                    "missing": sorted(missing),
+                },
+                decision=RecoveryAction.KEEP_UNFINISHED,
+            )
+            update = await _keep_evidence_pending(
+                ledger=ledger,
+                contract=contract,
+                state=state,
+                observation=observation,
+                violation=violation,
+                missing=missing,
+            )
+            task_contract = state.get("task_contract")
+            if task_contract is not None:
+                pending_ids = [
+                    item.obligation_id
+                    for item in pipeline.obligation_manager.pending(contract.task_id)
+                ]
+                update["task_contract"] = task_contract.replace_current_version(
+                    update["current_contract"]
+                ).with_pending_obligations(pending_ids)
+            if evidence_bundle is not None:
+                update["evidence_bundle"] = evidence_bundle
+            return update
 
         evidence_contract, pending_event = await transition_contract_and_record(
             ledger=ledger,
@@ -221,30 +382,35 @@ def build_act_observe_check_node(ledger: LedgerService) -> ActObserveNode:
                 "missing": [],
             },
         )
-        fulfilled_contract, fulfilled_event = await transition_contract_and_record(
-            ledger=ledger,
-            contract=evidence_contract,
-            thread_id=_thread_id(state),
-            target=ContractStatus.FULFILLED,
-            event_type=LedgerEventType.CONTRACT_FULFILLED,
-            actor="act_observe_check_node",
-            details={"obligations_fulfilled": evidence_contract.required_evidence},
-        )
         completed_observation: ObservationEvent = observation.model_copy(
             update={"is_complete": True}
         )
+        settled_task_contract = _settled_task_contract(state, evidence_contract)
         return {
-            "current_contract": fulfilled_contract,
+            "current_contract": evidence_contract,
+            **(
+                {"task_contract": settled_task_contract}
+                if settled_task_contract is not None
+                else {}
+            ),
             "current_observation": completed_observation,
+            **({"evidence_bundle": evidence_bundle} if evidence_bundle is not None else {}),
             "check_results": [TransitionResult.pass_through("act->observe")],
-            "ledger_events": [pending_event, obligation_event, fulfilled_event],
-            "ledger_head_hash": fulfilled_event.event_hash,
+            "ledger_events": [pending_event, obligation_event],
+            "ledger_head_hash": obligation_event.event_hash,
             "pending_obligations": [],
-            "next_route": "end",
-            "final_answer_allowed": True,
+            "next_route": "observe_think",
+            "final_answer_allowed": False,
         }
 
     return act_observe_check_node
+
+
+def _settled_task_contract(state: ReCAPState, contract: RuntimeContract):
+    task_contract = state.get("task_contract")
+    if task_contract is None:
+        return None
+    return task_contract.replace_current_version(contract).with_pending_obligations([])
 
 
 def route_after_act_observe(state: ReCAPState) -> AfterActObserveRoute:
@@ -252,6 +418,12 @@ def route_after_act_observe(state: ReCAPState) -> AfterActObserveRoute:
 
     contract = state.get("current_contract")
     route = state.get("next_route")
+    if (
+        route == "observe_think"
+        and contract is not None
+        and contract.status == ContractStatus.EVIDENCE_PENDING
+    ):
+        return "observe_think"
     if route == "replan" and contract is not None:
         return "replan"
     if route == "human_approval" and contract is not None:

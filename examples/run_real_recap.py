@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
 from recap.agent.runtime import build_real_runtime
+from recap.schemas import TaskEntry
 
 
 def print_ledger_event(entry: Any) -> None:
@@ -53,17 +54,42 @@ async def main() -> None:
 
     result = await graph.ainvoke(
         {
-            "messages": [
-                HumanMessage(
-                    content="Add 3 and 4."
-                )
-            ],
-            "task_id": "real-llm-demo-001",
-            "thread_id": "thread-001",
-            "round_num": 0,
-            "ledger_events": [],
-            "check_results": [],
-        }
+    "messages": [
+        HumanMessage(
+            content="Add 3 and 4."
+        )
+    ],
+    "task_id": "real-llm-demo-001",
+    "thread_id": "thread-001",
+    "round_num": 0,
+    "max_rounds": 8,
+    "task_entry": TaskEntry(
+        task_id="real-llm-demo-001",
+        description="Complete the approved arithmetic task",
+        policies=["arithmetic-policy"],
+        tools_available=[
+            "add",
+            "multiply",
+            "divide",
+            "text_stats",
+            "find_text",
+            "replace_text",
+            "parse_json",
+            "select_fields",
+            "filter_records",
+        ],
+        initial_permissions=[
+            "arithmetic:execute",
+            "text:process",
+            "data:process",
+        ],
+    ),
+    "contract_history": [],
+    "round_summaries": [],
+    "ledger_events": [],
+    "check_results": [],
+    "task_completed": False,
+}
     )
 
     messages = result.get("messages", [])

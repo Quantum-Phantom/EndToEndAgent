@@ -70,10 +70,20 @@ class RuntimeContract(BaseModel):
     argument_constraints: dict[str, Any] = Field(default_factory=dict)
     granted_permissions: list[str] = Field(default_factory=list)
     expected_effects: list[str] = Field(default_factory=list)
+    allowed_effects: list[str] = Field(default_factory=list)
     forbidden_effects: list[str] = Field(default_factory=list)
+    required_effects: list[str] = Field(default_factory=list)
     required_evidence: list[str] = Field(default_factory=list)
     authority_refs: list[str] = Field(default_factory=list)
     policy_refs: list[str] = Field(default_factory=list)
+    normative_baseline: list[str] = Field(
+        default_factory=lambda: [
+            "fail_closed",
+            "no_authority_expansion",
+            "no_unproven_success",
+            "preserve_pending_obligations",
+        ]
+    )
     status: ContractStatus = ContractStatus.DRAFT
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -87,6 +97,12 @@ class RuntimeContract(BaseModel):
             self.argument_constraints = dict(self.certificate.argument_constraints)
         if not self.expected_effects:
             self.expected_effects = [self.certificate.expected_effect]
+        if not self.allowed_effects:
+            self.allowed_effects = list(self.certificate.allowed_effects)
+        if not self.forbidden_effects:
+            self.forbidden_effects = list(self.certificate.forbidden_effects)
+        if not self.required_effects:
+            self.required_effects = list(self.certificate.required_effects)
         if not self.required_evidence:
             self.required_evidence = list(self.certificate.required_evidence)
         if not self.authority_refs:

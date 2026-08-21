@@ -29,10 +29,24 @@ def build_observe_node(ledger: LedgerService) -> ObserveNode:
         observation = ObservationEvent(
             call_id=action.call_id,
             return_content=result.content,
-            evidence_collected=["tool_return", "call_id_binding"],
-            data_source=DataSource.TOOL,
-            trust_level=TrustLevel.MEDIUM,
-            source_label=f"trusted_tool:{action.tool_name}",
+            state_diff=result.state_diff,
+            evidence_collected=list(
+                dict.fromkeys(
+                    [
+                        "tool_return",
+                        "call_id_binding",
+                        *result.evidence_collected,
+                    ]
+                )
+            ),
+            observed_effects=list(result.observed_effects),
+            data_source=result.data_source,
+            trust_level=result.trust_level,
+            source_label=(
+                f"external:{action.tool_name}"
+                if result.data_source == DataSource.EXTERNAL
+                else f"trusted_tool:{action.tool_name}"
+            ),
             is_complete=False,
         )
         event = await ledger.record(

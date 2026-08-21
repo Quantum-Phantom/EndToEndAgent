@@ -15,7 +15,32 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class ThinkProposal(BaseModel):
+    """One-round public proposal emitted by the Think stage."""
+
+    subgoal: str = Field(min_length=1)
+    tool_name: str | None = None
+    tool_args: dict[str, Any] = Field(default_factory=dict)
+    expected_effect: str = Field(min_length=1)
+    allowed_effects: list[str] = Field(default_factory=list)
+    forbidden_effects: list[str] = Field(default_factory=list)
+    required_effects: list[str] = Field(default_factory=list)
+    required_evidence: list[str] = Field(default_factory=list)
+    final_answer: str | None = None
+    plan_summary: str = Field(default="")
+
+    @model_validator(mode="after")
+    def validate_action_or_answer(self) -> "ThinkProposal":
+        has_tool = self.tool_name is not None
+        has_answer = bool(self.final_answer)
+        if has_tool == has_answer:
+            raise ValueError("exactly one of tool_name or final_answer must be supplied")
+        if not has_tool and self.tool_args:
+            raise ValueError("tool_args must be empty when no tool is selected")
+        return self
 
 
 # =============================================================================
@@ -114,12 +139,26 @@ class IntentCertificate(BaseModel):
     )
     authority_basis: str = Field(..., min_length=1, description="授权依据：用户指令或政策凭证")
     expected_effect: str = Field(..., min_length=1, description="预期效果：允许和禁止的状态变化")
+    allowed_effects: list[str] = Field(
+        default_factory=list,
+        description="本轮允许出现的可观测效果",
+    )
+    forbidden_effects: list[str] = Field(
+        default_factory=list,
+        description="本轮禁止出现的可观测效果",
+    )
+    required_effects: list[str] = Field(
+        default_factory=list,
+        description="本轮必须出现的可观测效果",
+    )
     required_evidence: list[str] = Field(
         default_factory=list,
         description="执行后必须获得的回执或来源证明",
     )
 
-    @field_validator("required_evidence")
+    @field_validator(
+        "allowed_effects", "forbidden_effects", "required_effects", "required_evidence"
+    )
     @classmethod
     def _ensure_unique_evidence(cls, v: list[str]) -> list[str]:
         """确保证据列表去重。"""
@@ -180,6 +219,7 @@ class ObservationEvent(BaseModel):
         description="执行前后状态差分，若无法观察则为 None",
     )
     evidence_collected: list[str] = Field(default_factory=list)
+    observed_effects: list[str] = Field(default_factory=list)
     data_source: DataSource = Field(default=DataSource.TOOL)
     trust_level: TrustLevel = Field(default=TrustLevel.MEDIUM)
     source_label: str = Field(default="", description="来源标签")
@@ -217,6 +257,13 @@ class ViolationEvidence(BaseModel):
         default_factory=list,
         description="最小违规证据链，每个元素为一条可追溯的事实或约束",
     )
+    task_id: str | None = None
+    thread_id: str | None = None
+    round_num: int | None = None
+    contract_id: str | None = None
+    action_digest: str | None = None
+    authority_refs: list[str] = Field(default_factory=list)
+    replay_input: dict[str, Any] | None = None
 
     def format_evidence(self) -> str:
         """生成可读的违规证据报告，便于日志和人工审计。"""

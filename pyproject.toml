@@ -17,6 +17,14 @@ dependencies = [
     "python-dotenv",
     "blake3",
     "orjson",
+    "z3-solver>=4.13,<5",
+    "asyncpg>=0.30,<1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "pytest-asyncio>=1,<2",
 ]
 
 [tool.setuptools.packages.find]

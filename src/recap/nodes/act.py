@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
+import hashlib
 
 import orjson
 from langchain_core.messages import ToolMessage
@@ -12,6 +13,7 @@ from recap.agent.state import ReCAPState
 from recap.contracts import ContractStatus, RuntimeContract
 from recap.integration import record_violation, transition_contract_and_record
 from recap.ledger import LedgerEvent, LedgerEventType, LedgerService
+from recap.recovery import route_for_recovery
 from recap.schemas import (
     ActionEvent,
     ExecutionStatus,
@@ -95,10 +97,7 @@ def build_act_node(
             round_num=executing.round_num,
             contract_id=executing.contract_id,
             actor="act_node",
-            payload={
-                "action": action.model_dump(mode="json"),
-                "tool_result": result.model_dump(mode="json"),
-            },
+            payload=_execution_payload(action, result, registry),
         )
         events = [contract_event, started_event, action_event]
 
@@ -143,6 +142,29 @@ def build_act_node(
         }
 
     return act_node
+
+
+def _execution_payload(
+    action: ActionEvent,
+    result: Any,
+    registry: ToolRegistry,
+) -> dict[str, Any]:
+    action_payload = action.model_dump(mode="json")
+    result_payload = result.model_dump(mode="json")
+    try:
+        redact_arguments = registry.get_capability(action.tool_name).risk_level == "high"
+    except LookupError:
+        redact_arguments = True
+    if redact_arguments:
+        action_payload["actual_params"] = {
+            key: f"sha256:{hashlib.sha256(str(value).encode('utf-8')).hexdigest()}"
+            for key, value in action.actual_params.items()
+        }
+        result_payload["args"] = {
+            key: action_payload["actual_params"][key]
+            for key in action.actual_params
+        }
+    return {"action": action_payload, "tool_result": result_payload}
 
 
 def route_after_act(state: ReCAPState) -> ActRoute:
@@ -267,7 +289,7 @@ async def _block_before_execution(
         "check_results": [TransitionResult.blocked("think->act", [violation])],
         "ledger_events": events,
         "ledger_head_hash": events[-1].event_hash,
-        "next_route": "end",
+        "next_route": route_for_recovery(violation.decision),
         "final_answer_allowed": False,
     }
 
