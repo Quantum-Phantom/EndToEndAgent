@@ -10,15 +10,21 @@ from recap.tools.data import DATA_TOOLS
 from recap.tools.evidence import EVIDENCE_TOOLS
 from recap.tools.email import EMAIL_TOOLS, SANDBOX_MAILBOX, SandboxMailbox, SandboxMessage
 from recap.tools.registry import ToolRegistry
+from recap.tools.result import StructuredToolOutput, ToolOutputStatus, TrustedAuthorizationFact
 from recap.tools.text import TEXT_TOOLS
 from recap.tools.wrapper import (
+    ToolResultEnvelope,
     TrustedToolResult,
     execute_trusted_tool,
 )
 
 __all__ = [
     "ToolRegistry",
+    "StructuredToolOutput",
+    "ToolOutputStatus",
+    "TrustedAuthorizationFact",
     "TrustedToolResult",
+    "ToolResultEnvelope",
     "execute_trusted_tool",
     "ARITHMETIC_CAPABILITIES",
     "ARITHMETIC_TOOLS",

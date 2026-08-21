@@ -100,6 +100,26 @@ def build_act_node(
             payload=_execution_payload(action, result, registry),
         )
         events = [contract_event, started_event, action_event]
+        for fact in result.authorization_facts:
+            fact_event = await ledger.record(
+                event_type=LedgerEventType.AUTHORIZATION_FACT_ISSUED,
+                task_id=executing.task_id,
+                thread_id=thread_id,
+                round_num=executing.round_num,
+                contract_id=executing.contract_id,
+                actor="trusted_tool_wrapper",
+                payload={
+                    "fact_id": fact.fact_id,
+                    "fact_type": fact.fact_type,
+                    "issuer_tool": fact.issuer_tool,
+                    "source": fact.source,
+                    "claim_digests": {
+                        key: hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+                        for key, value in fact.claims.items()
+                    },
+                },
+            )
+            events.append(fact_event)
 
         if not result.success:
             failed, failed_event = await transition_contract_and_record(
@@ -129,6 +149,11 @@ def build_act_node(
             "current_contract": executing,
             "current_action": action,
             "raw_tool_result": result,
+            **(
+                {"authorization_facts": result.authorization_facts}
+                if result.authorization_facts
+                else {}
+            ),
             "messages": [
                 ToolMessage(
                     content=_tool_message_content(result.content),
@@ -136,7 +161,7 @@ def build_act_node(
                 )
             ],
             "ledger_events": events,
-            "ledger_head_hash": action_event.event_hash,
+            "ledger_head_hash": events[-1].event_hash,
             "next_route": "observe",
             "final_answer_allowed": False,
         }
@@ -164,6 +189,11 @@ def _execution_payload(
             key: action_payload["actual_params"][key]
             for key in action.actual_params
         }
+        for fact in result_payload.get("authorization_facts", []):
+            fact["claims"] = {
+                key: f"sha256:{hashlib.sha256(str(value).encode('utf-8')).hexdigest()}"
+                for key, value in fact.get("claims", {}).items()
+            }
     return {"action": action_payload, "tool_result": result_payload}
 
 

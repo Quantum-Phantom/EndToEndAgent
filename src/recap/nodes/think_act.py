@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
+import hashlib
 
 from recap.agent.state import ReCAPState
 from recap.contracts import ContractPipeline, ContractStatus, RuntimeContract, TaskContract
@@ -62,6 +63,7 @@ def build_think_act_check_node(
             )
         tool_name = candidate.get("name")
         actual_args = candidate.get("args", {})
+        consumed_facts: list[Any] = []
         if not isinstance(actual_args, dict):
             return await _block(
                 ledger,
@@ -125,6 +127,32 @@ def build_think_act_check_node(
                     ),
                     state,
                 )
+            for requirement in capability.authorization_requirements:
+                fact = _matching_authorization_fact(
+                    state.get("authorization_facts", []), requirement, actual_args
+                )
+                if fact is None:
+                    return await _block(
+                        ledger,
+                        contract,
+                        _thread_id(state),
+                        _violation(
+                            "CONTRACT-AUTHORIZATION-FACT-001",
+                            "Candidate action lacks a trusted authorization fact bound to its arguments",
+                            "authorization_requirements",
+                            requirement.model_dump(mode="json"),
+                            {
+                                "available_fact_types": sorted({
+                                    _fact_value(item, "fact_type")
+                                    for item in state.get("authorization_facts", [])
+                                }),
+                                "argument_fields": sorted(actual_args),
+                            },
+                            decision=RecoveryAction.REPLAN,
+                        ),
+                        state,
+                    )
+                consumed_facts.append((fact, requirement))
         try:
             constraint_result = pipeline.verify_runtime_action(contract, actual_args)
         except Exception as exc:
@@ -210,18 +238,64 @@ def build_think_act_check_node(
                 "action_digest": digest,
             },
         )
+        consumed_events: list[LedgerEvent] = []
+        for fact, requirement in consumed_facts:
+            event = await ledger.record(
+                event_type=LedgerEventType.AUTHORIZATION_FACT_CONSUMED,
+                task_id=active.task_id,
+                thread_id=_thread_id(state),
+                round_num=active.round_num,
+                contract_id=active.contract_id,
+                actor="think_act_check_node",
+                payload={
+                    "fact_id": _fact_value(fact, "fact_id"),
+                    "fact_type": requirement.fact_type,
+                    "tool_name": tool_name,
+                    "action_digest": digest,
+                    "binding_digests": {
+                        argument: hashlib.sha256(
+                            str(actual_args.get(argument)).encode("utf-8")
+                        ).hexdigest()
+                        for argument in requirement.argument_claim_bindings
+                    },
+                },
+            )
+            consumed_events.append(event)
         return {
             "current_contract": active,
             "task_contract": task_contract.replace_current_version(active),
             "approved_action_digest": digest,
             "check_results": [TransitionResult.pass_through("think->act")],
-            "ledger_events": [activated, approved],
-            "ledger_head_hash": approved.event_hash,
+            "ledger_events": [activated, approved, *consumed_events],
+            "ledger_head_hash": (
+                consumed_events[-1].event_hash if consumed_events else approved.event_hash
+            ),
             "next_route": "act",
             "final_answer_allowed": False,
         }
 
     return think_act_check_node
+
+
+def _fact_value(fact: Any, field: str) -> Any:
+    return fact.get(field) if isinstance(fact, dict) else getattr(fact, field, None)
+
+
+def _matching_authorization_fact(
+    facts: list[Any], requirement: Any, arguments: dict[str, Any]
+) -> Any | None:
+    for fact in facts:
+        if _fact_value(fact, "fact_type") != requirement.fact_type:
+            continue
+        claims = _fact_value(fact, "claims") or {}
+        if all(
+            argument in arguments
+            and claim in claims
+            and arguments[argument] == claims[claim]
+            for argument, claim in requirement.argument_claim_bindings.items()
+        ):
+            return fact
+    return None
 
 
 def route_after_think_act(state: ReCAPState) -> ThinkActRoute:

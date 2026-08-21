@@ -12,6 +12,7 @@ from recap.contracts import (
     ContractPipeline,
     TaskContract,
     ToolCapability,
+    PolicyRule,
 )
 from recap.ledger import LedgerEventType
 from recap.agent.state import ReCAPState
@@ -216,12 +217,14 @@ def build_think_node(
     *,
     pipeline: ContractPipeline | None = None,
     capabilities: Mapping[str, ToolCapability] | None = None,
+    policy_rules: list[PolicyRule] | None = None,
     system_prompt: str = BASE_PROMPT,
 ):
     """构造真实 LLM Think 节点；Contract/权限/约束均由本地运行时生成。"""
 
     pipeline = pipeline or ContractPipeline()
     capabilities = dict(capabilities or {})
+    policy_rules = list(policy_rules or [])
     tool_specs = tuple(
         {
             **spec,
@@ -398,6 +401,7 @@ def build_think_node(
                     task_contract,
                     certificate,
                     capability,
+                    policy_rules,
                 )
             except (PermissionError, ValueError) as exc:
                 return await _planning_violation(

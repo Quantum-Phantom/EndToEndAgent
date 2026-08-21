@@ -80,6 +80,30 @@ def _validate_message(recipient: str, subject: str, body: str) -> None:
 SANDBOX_MAILBOX = SandboxMailbox()
 
 
+class SandboxEmailObserver:
+    def snapshot(self) -> dict[str, Any]:
+        return SANDBOX_MAILBOX.snapshot()
+
+    def effects(self, before, after, tool_return):
+        if before == after or not isinstance(tool_return, dict):
+            return [], [], None
+        receipt = {
+            key: tool_return[key]
+            for key in (
+                "message_id",
+                "recipient_digest",
+                "subject_digest",
+                "content_digest",
+            )
+            if key in tool_return
+        }
+        return (
+            ["sandbox_email_sent"],
+            ["sandbox_email_receipt", "message_id"],
+            {"before": before, "after": after, "effect_receipt": receipt},
+        )
+
+
 @tool
 async def send_email(recipient: str, subject: str, body: str) -> dict[str, Any]:
     """Send one plain-text message to the local sandbox mailbox."""
@@ -87,6 +111,7 @@ async def send_email(recipient: str, subject: str, body: str) -> dict[str, Any]:
 
 
 send_email.metadata = {
+    "recap_effect_observer": SandboxEmailObserver(),
     "recap_observed_effects": ["sandbox_email_sent"],
     "recap_state_snapshot": SANDBOX_MAILBOX.snapshot,
     "recap_effect_evidence": ["sandbox_email_receipt", "message_id"],

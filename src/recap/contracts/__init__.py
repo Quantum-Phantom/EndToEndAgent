@@ -1,4 +1,4 @@
-from recap.contracts.capabilities import ToolCapability
+from recap.contracts.capabilities import AuthorizationRequirement, ToolCapability
 from recap.contracts.compiler import PolicyCompiler
 from recap.contracts.models import ContractStatus, RuntimeContract
 from recap.contracts.pipeline import ContractPipeline
@@ -15,4 +15,5 @@ __all__ = [
     "RuntimeContract",
     "TaskContract",
     "ToolCapability",
+    "AuthorizationRequirement",
 ]

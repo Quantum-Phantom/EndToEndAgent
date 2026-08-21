@@ -9,6 +9,13 @@ from pydantic import BaseModel, Field, model_validator
 from recap.schemas import DataSource, TrustLevel
 
 
+class AuthorizationRequirement(BaseModel):
+    """Bind concrete action arguments to claims in a trusted authorization fact."""
+
+    fact_type: str = Field(min_length=1)
+    argument_claim_bindings: dict[str, str] = Field(min_length=1)
+
+
 class ToolCapability(BaseModel):
     """Machine-checkable boundary declared by a tool implementation."""
 
@@ -20,6 +27,7 @@ class ToolCapability(BaseModel):
     required_effects: list[str] = Field(default_factory=list)
     evidence_types: list[str] = Field(default_factory=list)
     observable_state: list[str] = Field(default_factory=list)
+    authorization_requirements: list[AuthorizationRequirement] = Field(default_factory=list)
     data_source: DataSource = DataSource.TOOL
     trust_level: TrustLevel = TrustLevel.MEDIUM
     risk_level: str = Field(default="medium", pattern=r"^(low|medium|high)$")

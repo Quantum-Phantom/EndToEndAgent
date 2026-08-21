@@ -30,6 +30,8 @@ class LedgerEventType(str, Enum):
     OBSERVATION_PURIFIED = "observation_purified"
     HUMAN_APPROVAL_REQUESTED = "human_approval_requested"
     HUMAN_DECISION_RECORDED = "human_decision_recorded"
+    AUTHORIZATION_FACT_ISSUED = "authorization_fact_issued"
+    AUTHORIZATION_FACT_CONSUMED = "authorization_fact_consumed"
     CONTRACT_EVIDENCE_PENDING = "contract_evidence_pending"
     CONTRACT_FULFILLED = "contract_fulfilled"
     CONTRACT_VIOLATED = "contract_violated"

@@ -19,6 +19,7 @@ from recap.contracts import ContractPipeline
 from recap.ledger import LedgerService, build_ledger_repository
 from recap.nodes.think import build_think_node
 from recap.tools import ALL_TOOLS, TOOL_CAPABILITIES, ToolRegistry
+from recap.runtime import RuntimeScenario
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -66,6 +67,7 @@ def build_real_runtime(
     sqlite_path: str | Path | None = None,
     postgres_dsn: str | None = None,
     approval_service: HumanApprovalService | None = None,
+    scenario: RuntimeScenario | None = None,
 ):
     """构建真实 LLM、Ledger、工具注册表和已编译 ReCAP Graph。"""
 
@@ -99,18 +101,30 @@ def build_real_runtime(
     registry = ToolRegistry()
     pipeline = ContractPipeline()
 
-    for tool in ALL_TOOLS:
-        capability = TOOL_CAPABILITIES.get(tool.name)
-        if capability is None:
-            raise RuntimeError(f"Tool has no declared ToolCapability: {tool.name}")
-        registry.register(tool, capability)
+    scenario = scenario or RuntimeScenario(
+        tools=list(ALL_TOOLS),
+        capabilities=dict(TOOL_CAPABILITIES),
+        initial_permissions=sorted({
+            permission
+            for capability in TOOL_CAPABILITIES.values()
+            for permission in capability.required_permissions
+        }),
+    )
+
+    for tool in scenario.tools:
+        registry.register(
+            tool,
+            scenario.capabilities[tool.name],
+            scenario.observers.get(tool.name),
+        )
 
     think_node = build_think_node(
         llm=llm,
         ledger=ledger,
-        tools=ALL_TOOLS,
+        tools=scenario.tools,
         pipeline=pipeline,
-        capabilities=TOOL_CAPABILITIES,
+        capabilities=scenario.capabilities,
+        policy_rules=scenario.policy_rules,
     )
 
     graph = compile_recap_graph(

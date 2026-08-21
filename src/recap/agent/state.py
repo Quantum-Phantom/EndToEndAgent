@@ -22,6 +22,7 @@ from recap.schemas import (
     TransitionResult,
 )
 from recap.approval import ApprovalRequest, HumanDecision
+from recap.tools.result import TrustedAuthorizationFact
 
 RouteName = Literal[
     "think",
@@ -54,6 +55,7 @@ class ReCAPState(MessagesState):
     approved_action_digest: NotRequired[str | None]
     raw_tool_result: NotRequired[Any]
     evidence_bundle: NotRequired[EvidenceBundle]
+    authorization_facts: NotRequired[Annotated[list[TrustedAuthorizationFact], add]]
 
     purified_context: NotRequired[Any]
     consumed_purified_context: NotRequired[bool]

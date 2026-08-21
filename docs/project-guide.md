@@ -284,7 +284,10 @@ recap_effect_evidence
 recap_effect_receipt_fields
 ```
 
-wrapper 在调用前后读取可信 snapshot，`_state_diff()`产生 before/after 和 receipt 字段。若声明 snapshot 的工具没有真实状态变化，就不声明 effect/effect evidence。
+wrapper 通过场景注册的 `EffectObserver` 在调用前后读取可信 snapshot；Observer
+产生 before/after、state diff、effect 和 effect evidence。工具只返回业务结果，
+不得自行返回或声明 state diff。若 Observer 没有观测到真实状态变化，就不声明
+effect/effect evidence。
 
 `tool_return`只证明工具返回被包装；effect proof 还要求可信 observer 的状态差分和 receipt。对于纯工具，两者可以只需要返回/绑定；对于邮件，字符串 `success` 不能替代 mailbox count/hash 变化。
 
@@ -611,4 +614,3 @@ User / Benchmark Policy / TaskEntry
 Every transition -> integration.py -> LedgerService
                                    -> Memory / SQLite / PostgreSQL
 ```
-
