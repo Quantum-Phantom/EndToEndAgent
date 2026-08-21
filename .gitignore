@@ -19,3 +19,4 @@ __pycache__/
 .pytest_cache/
 *.sqlite3
 *.db
+artifacts/retail-evaluation/
