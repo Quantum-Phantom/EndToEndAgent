@@ -16,6 +16,8 @@ from recap.graph import (
     extract_certificate,
     _contains_control_directive,
     _purify,
+    act_observe_check_node,
+    observe_node,
     observe_think_check_node,
     think_act_check_node,
 )
@@ -28,13 +30,23 @@ from recap.schemas import (
     ConstraintValueType,
     DataSource,
     ExecutionStatus,
+    EvidenceType,
     IntentCertificate,
+    ObligationEntry,
+    ObligationStatus,
     ObservationEvent,
     RecoveryAction,
     TaskEntry,
     TrustLevel,
     ViolationType,
 )
+from recap.ledger import (
+    collect_evidence,
+    get_ledger_store,
+    reset_ledger_store,
+)
+from langchain_core.messages import ToolMessage
+
 from recap.tools import (
     TOOLS_BY_NAME,
     RetailDatabase,
@@ -358,6 +370,190 @@ class TestMultiRoundFreshIntent(unittest.TestCase):
         for cr in check_results:
             self.assertTrue(cr.passed, f"unexpected rejection: {cr.violations}")
             self.assertEqual(cr.check_type, "think->act")
+
+
+class TestEvidenceCollection(unittest.TestCase):
+    def _action(self, tool_name):
+        return ActionEvent(tool_name=tool_name, actual_params={})
+
+    def test_verify_identity_session_token(self):
+        collected = collect_evidence(
+            self._action("verify_identity"),
+            "identity verified: customer=Alice Wang session=session-1234abcd",
+        )
+        self.assertEqual(collected, {EvidenceType.SESSION_TOKEN: "session-1234abcd"})
+
+    def test_lookup_order_evidence(self):
+        collected = collect_evidence(
+            self._action("lookup_order"),
+            "order O001: customer=C001 status=delivered sku=SKU-100 qty=1",
+        )
+        self.assertEqual(collected, {EvidenceType.ORDER_RETRIEVAL: "delivered"})
+
+    def test_wrong_tool_yields_no_evidence(self):
+        collected = collect_evidence(
+            self._action("check_inventory"),
+            "identity verified: session=session-x",
+        )
+        self.assertEqual(collected, {})
+
+
+class TestEvidenceObligationClosure(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ledger_path = Path(tmp.name) / "ledger.jsonl"
+        reset_ledger_store(self.ledger_path)
+
+    def _cert(self, op, evidence):
+        return IntentCertificate(
+            round_num=1,
+            subgoal="demo",
+            proposed_operation=op,
+            argument_constraints={},
+            authority_basis=AuthorityBasis.USER_REQUEST,
+            expected_effect="demo effect",
+            required_evidence=[evidence],
+        )
+
+    def test_observe_collects_evidence_and_creates_pending_obligation(self):
+        cert = self._cert("verify_identity", EvidenceType.SESSION_TOKEN)
+        action = ActionEvent(
+            tool_name="verify_identity",
+            actual_params={},
+            execution_status=ExecutionStatus.SUCCESS,
+        )
+        state = {
+            "current_intent": cert,
+            "current_action": action,
+            "messages": [
+                ToolMessage(
+                    content="identity verified: customer=Alice session=session-1",
+                    tool_call_id="tc-1",
+                )
+            ],
+            "ledger_entries": [],
+        }
+        out = observe_node(state)
+        self.assertIn("session_token", out["current_observation"].evidence_collected)
+        obligations = [
+            e for e in out["ledger_entries"]
+            if isinstance(e, ObligationEntry)
+        ]
+        self.assertTrue(obligations)
+        self.assertTrue(all(o.status == ObligationStatus.PENDING for o in obligations))
+
+    def test_act_observe_fulfills_obligation(self):
+        cert = self._cert("verify_identity", EvidenceType.SESSION_TOKEN)
+        action = ActionEvent(
+            tool_name="verify_identity",
+            actual_params={},
+            execution_status=ExecutionStatus.SUCCESS,
+        )
+        obs = ObservationEvent(
+            call_id="tc-1",
+            return_content="identity verified: session=session-1",
+            evidence_collected=["session_token"],
+        )
+        state = {
+            "current_intent": cert,
+            "current_action": action,
+            "current_observation": obs,
+            "ledger_entries": [],
+        }
+        out = act_observe_check_node(state)
+        result = out["check_results"][0]
+        self.assertTrue(result.passed, result.violations)
+        self.assertTrue(out["current_observation"].is_complete)
+        fulfilled = [
+            e for e in out["ledger_entries"]
+            if isinstance(e, ObligationEntry) and e.status == ObligationStatus.FULFILLED
+        ]
+        self.assertTrue(fulfilled)
+        self.assertEqual(get_ledger_store().open_obligations(), [])
+
+    def test_act_observe_insufficient_evidence(self):
+        cert = self._cert("verify_identity", EvidenceType.SESSION_TOKEN)
+        action = ActionEvent(
+            tool_name="verify_identity",
+            actual_params={},
+            execution_status=ExecutionStatus.SUCCESS,
+        )
+        obs = ObservationEvent(call_id="tc-1", return_content="identity verification FAILED")
+        state = {
+            "current_intent": cert,
+            "current_action": action,
+            "current_observation": obs,
+            "ledger_entries": [],
+        }
+        out = act_observe_check_node(state)
+        result = out["check_results"][0]
+        self.assertFalse(result.passed)
+        self.assertEqual(result.violations[0].violation_type, ViolationType.EVIDENCE_INSUFFICIENT)
+        self.assertIn(RecoveryAction.KEEP_UNFINISHED, result.recovery_actions)
+
+
+class TestCertRequiresEvidence(unittest.TestCase):
+    def test_missing_required_evidence_detected(self):
+        from recap.graph import _missing_cert_fields
+        data = {
+            "subgoal": "x",
+            "proposed_operation": "y",
+            "authority_basis": "user_request",
+            "expected_effect": "e",
+        }
+        self.assertIn("required_evidence", _missing_cert_fields(data))
+
+    def test_empty_evidence_list_is_acceptable(self):
+        from recap.graph import _missing_cert_fields
+        data = {
+            "subgoal": "x",
+            "proposed_operation": "y",
+            "authority_basis": "user_request",
+            "expected_effect": "e",
+            "required_evidence": [],
+        }
+        self.assertEqual(_missing_cert_fields(data), [])
+
+    def test_unknown_evidence_rejected(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            IntentCertificate(
+                subgoal="x",
+                proposed_operation="y",
+                argument_constraints={},
+                authority_basis=AuthorityBasis.USER_REQUEST,
+                expected_effect="e",
+                required_evidence=["not_an_evidence_type"],
+            )
+
+
+class TestLedgerPersistence(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ledger_path = Path(tmp.name) / "ledger.jsonl"
+        reset_ledger_store(self.ledger_path)
+
+    def test_append_and_reload(self):
+        store = get_ledger_store()
+        store.append(TaskEntry(description="demo", tools_available=["a", "b"]))
+        self.assertEqual(len(store.entries), 1)
+        # 重新加载同一文件 => 条目被恢复
+        reset_ledger_store(self.ledger_path)
+        reloaded = get_ledger_store()
+        self.assertEqual(len(reloaded.entries), 1)
+        self.assertEqual(reloaded.entries[0].entry_type, "task")
+
+    def test_open_obligations_dedupes_latest_status(self):
+        store = get_ledger_store()
+        store.append(ObligationEntry(
+            obligation_id="obl-1", description="e1", status=ObligationStatus.PENDING,
+        ))
+        store.append(ObligationEntry(
+            obligation_id="obl-1", description="e1", status=ObligationStatus.FULFILLED,
+        ))
+        self.assertEqual(store.open_obligations(), [])
 
 
 if __name__ == "__main__":

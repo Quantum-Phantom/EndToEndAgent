@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from operator import add
 from typing import Annotated, Any, Literal, NotRequired
 
@@ -20,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import MessagesState
 
 from recap.schemas import (
+    EvidenceType,
     ActionEntry,
     ActionEvent,
     AuthorityBasis,
@@ -35,6 +37,8 @@ from recap.schemas import (
     ObservationEntry,
     ObservationEvent,
     RecoveryAction,
+    RepairEntry,
+    ReplanEntry,
     TaskEntry,
     TransitionResult,
     TrustLevel,
@@ -42,6 +46,7 @@ from recap.schemas import (
     ViolationEvidence,
     ViolationType,
 )
+from recap.ledger import collect_evidence, get_ledger_store
 from recap.tools import DeterministicToolError, TOOLS_BY_NAME
 
 # =============================================================================
@@ -53,7 +58,13 @@ _llm: Any = None
 
 # 证书提取规则：LLM 在 AIMessage 文本中以结构化证书块输出，亦可由
 # structured output 直接在 state 中携带（见 current_intent 直接赋值路径）。
-_CERT_KEYS = ("subgoal", "proposed_operation", "authority_basis", "expected_effect")
+_CERT_KEYS = (
+    "subgoal",
+    "proposed_operation",
+    "authority_basis",
+    "expected_effect",
+    "required_evidence",
+)
 
 
 def set_llm(llm: Any) -> None:
@@ -91,10 +102,18 @@ def extract_certificate(text: str) -> dict[str, Any] | None:
 
 
 def _missing_cert_fields(data: dict[str, Any]) -> list[str]:
-    """返回证书缺失的关键字段名。"""
+    """返回证书缺失的关键字段名。
+
+    required_evidence 为列表类型：空列表 `[]` 合法（表示无义务），仅缺失
+    或非列表时视为缺失；其余字符串字段非空即为存在。
+    """
     missing = []
     for key in _CERT_KEYS:
-        if not data.get(key):
+        value = data.get(key)
+        if key == "required_evidence":
+            if value is None or not isinstance(value, list):
+                missing.append(key)
+        elif not value:
             missing.append(key)
     return missing
 
@@ -317,12 +336,9 @@ def think_node(state: ReCAPState) -> dict:
     task_desc = task.description if task else ""
     tools_available = task.tools_available if task else list(TOOLS_BY_NAME)
 
-    # 收集本轮尚未完成的义务，注入为显式约束提示
-    pending_obligations = [
-        e
-        for e in state.get("ledger_entries", [])
-        if isinstance(e, ObligationEntry) and e.status == ObligationStatus.PENDING
-    ]
+    # 收集本轮尚未完成的义务，注入为显式约束提示（按 obligation_id
+    # 去重取最新状态，避免历史 PENDING 条目掩盖已闭合的义务）。
+    pending_obligations = get_ledger_store().open_obligations()
     obligation_hint = ""
     if pending_obligations:
             obligation_hint = (
@@ -360,7 +376,8 @@ def think_node(state: ReCAPState) -> dict:
         "eq/ne/ge/le/gt/lt/in/not_in/regex/expr.\n"
         "  Free-text strings are forbidden as parameter values — string identifiers must use enum with an "
         "ARRAY of allowed values (value must be an array, e.g. [\"O001\"]); a bare string value is strictly forbidden.\n"
-        "- required_evidence must be a JSON array (possibly empty []).\n"
+        "- required_evidence must be present as a JSON array (possibly empty []), "
+        "drawn from the controlled EvidenceType vocabulary. \n"
         "Complete example:\n"
         "```json\n"
         "{\n"
@@ -373,7 +390,7 @@ def think_node(state: ReCAPState) -> dict:
         "  },\n"
         '  "authority_basis": "user_request",\n'
         '  "expected_effect": "identity verification passes and a session_token is returned",\n'
-        '  "required_evidence": []\n'
+        '  "required_evidence": ["session_token"]\n'
         "}\n"
         "```\n"
         "Constraints: never access other customers' records, never modify order status, never leak exact inventory numbers.\n"
@@ -420,7 +437,7 @@ def think_node(state: ReCAPState) -> dict:
         "round_num": round_num,
         "current_intent": cert,
         "messages": [ai_message] if ai_message is not None else [],
-        "ledger_entries": ledger,
+        "ledger_entries": _record(*ledger)["ledger_entries"],
     }
 
 
@@ -505,13 +522,21 @@ def think_act_check_node(state: ReCAPState) -> dict:
     return _emit_check(result, name="think->act")
 
 
+def _record(*entries: LedgerEntry) -> dict:
+    """持久化账本条目（JSONL 追加）并返回状态追加更新。"""
+    store = get_ledger_store()
+    for entry in entries:
+        store.append(entry)
+    return {"ledger_entries": list(entries)}
+
+
 def _emit_check(result: TransitionResult, name: str = "") -> dict:
     """将检查结果写入账本并返回 checkpoint 状态更新。"""
     del name
     ledger: list[LedgerEntry] = []
     for v in result.violations:
         ledger.append(ViolationEntry(violation=v))
-    return {"check_results": [result], "ledger_entries": ledger}
+    return {"check_results": [result], "ledger_entries": _record(*ledger)["ledger_entries"]}
 
 
 def act_node(state: ReCAPState) -> dict:
@@ -578,7 +603,7 @@ def act_node(state: ReCAPState) -> dict:
     return {
         "current_action": current_action,
         "messages": tool_messages,
-        "ledger_entries": ledger,
+        "ledger_entries": _record(*ledger)["ledger_entries"],
     }
 
 
@@ -617,13 +642,12 @@ def observe_node(state: ReCAPState) -> dict:
             is_complete=False,
         )
         obs_entry: list[LedgerEntry] = [ObservationEntry(observation=obs)]
-        return {"current_observation": obs, "ledger_entries": obs_entry}
+        return {"current_observation": obs, "ledger_entries": _record(*obs_entry)["ledger_entries"]}
 
     # 来源与信任标记（保守：外部工具返回低信任）
     data_source = DataSource.TOOL
     trust_level = TrustLevel.MEDIUM
     if action.tool_name in {"escalate_to_human"}:
-        # 人机边界：转接本身属于系统受控操作
         data_source = DataSource.SYSTEM
         trust_level = TrustLevel.HIGH
 
@@ -636,19 +660,31 @@ def observe_node(state: ReCAPState) -> dict:
         is_complete=action.execution_status == ExecutionStatus.SUCCESS,
     )
 
-    # 证据义务：未完成任务建立 PENDING obligation
+    # 确定性证据收集：来源工具 + 正则命中才算收集到该证据。
+    collected = collect_evidence(action, obs.return_content)
+
+    # 证据义务：按证书声明建立 PENDING obligation；obligation_id 基于
+    # 证书 + 证据确定性生成，便于 act_observe_check 闭闭合环。
     ledger: list[LedgerEntry] = [ObservationEntry(observation=obs)]
     if cert is not None:
         for evidence in cert.required_evidence:
+            obligation_id = f"obl-{cert.certificate_id}-{evidence.value}"
             ledger.append(
                 ObligationEntry(
-                    description=f"evidence '{evidence}' from {action.tool_name}",
+                    obligation_id=obligation_id,
+                    description=f"evidence '{evidence.value}' from {action.tool_name}",
                     certificate_id=cert.certificate_id,
                     status=ObligationStatus.PENDING,
                 )
             )
+        if collected:
+            updated = obs.model_copy(
+                update={"evidence_collected": [e.value for e in collected]}
+            )
+            ledger[0] = ObservationEntry(observation=updated)
+            obs = updated
 
-    return {"current_observation": obs, "ledger_entries": ledger}
+    return {"current_observation": obs, "ledger_entries": _record(*ledger)["ledger_entries"]}
 
 
 def act_observe_check_node(state: ReCAPState) -> dict:
@@ -686,38 +722,79 @@ def act_observe_check_node(state: ReCAPState) -> dict:
         return _emit_check(TransitionResult.blocked("act->observe", [v], [RecoveryAction.REPLAN]))
 
     violations: list[ViolationEvidence] = []
+    obligation_updates: list[LedgerEntry] = []
 
     # 单次工具调用策略：每轮仅一个动作与一个观测，Act→Observe 阶段
     # 一对一对应，无需做 call_id 多路绑定校验（防串线已由单调用保证）。
 
-    # 1. 状态差分与预期效果（不可观测 -> unknown）
-    if obs.state_diff is None:
-        # 效果不可观测，标记为 unknown，不视为违规，仅声明确认受限
-        obs.is_complete = obs.is_complete and False
+    required: list[EvidenceType] = list(cert.required_evidence) if cert else []
+    collected: set[EvidenceType] = {EvidenceType(e) for e in obs.evidence_collected}
 
-    # 3. 证据义务闭环
-    required = cert.required_evidence if cert else []
-    if action.execution_status != ExecutionStatus.SUCCESS:
+    failed = action.execution_status != ExecutionStatus.SUCCESS
+
+    # 1. 证据义务闭环：按确定性 obligation_id 逐项判定 FULFILLED 或
+    #    EVIDENCE_INSUFFICIENT（KEEP_UNFINISHED）。
+    if required and failed:
         # 执行失败/被阻断：证据不可能齐全
-        if required:
-            violations.append(
-                ViolationEvidence(
-                    violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
-                    rule_id="R-EVIDENCE-COMPLETE",
-                    rule_description="required evidence cannot be collected from a failed action",
-                    expected_value=required,
-                    actual_value=action.execution_status.value,
-                    decision=RecoveryAction.KEEP_UNFINISHED,
-                    evidence_chain=[f"Action status = {action.execution_status.value}"],
-                )
+        violations.append(
+            ViolationEvidence(
+                violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
+                rule_id="R-EVIDENCE-COMPLETE",
+                rule_description="required evidence cannot be collected from a failed action",
+                expected_value=[e.value for e in required],
+                actual_value=action.execution_status.value,
+                decision=RecoveryAction.KEEP_UNFINISHED,
+                evidence_chain=[f"Action status = {action.execution_status.value}"],
             )
+        )
+    else:
+        for evidence in required:
+            cert_id = cert.certificate_id if cert is not None else ""
+            obligation_id = f"obl-{cert_id}-{evidence.value}"
+            if evidence in collected:
+                obligation_updates.append(
+                    ObligationEntry(
+                        obligation_id=obligation_id,
+                        description=f"evidence '{evidence.value}' from {action.tool_name}",
+                        certificate_id=cert_id,
+                        status=ObligationStatus.FULFILLED,
+                        created_at=obs.timestamp,
+                        fulfilled_at=datetime.now(timezone.utc),
+                    )
+                )
+            else:
+                violations.append(
+                    ViolationEvidence(
+                        violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
+                        rule_id="R-EVIDENCE-COMPLETE",
+                        rule_description=(
+                            f"evidence '{evidence.value}' was declared but not collected "
+                            f"from {action.tool_name}"
+                        ),
+                        intent_field="required_evidence",
+                        expected_value=evidence.value,
+                        actual_value=sorted(e.value for e in collected),
+                        decision=RecoveryAction.KEEP_UNFINISHED,
+                        evidence_chain=[
+                            f"Intent: required_evidence includes {evidence.value}",
+                            f"Observation: collected evidence = {sorted(e.value for e in collected)}",
+                        ],
+                    )
+                )
+
+    # 2. 效果可观测性：state_diff 不可观测时不伪造成功/完成
+    obs.is_complete = bool(not violations and not failed)
 
     if violations:
         result = TransitionResult.blocked("act->observe", violations)
     else:
         result = TransitionResult.pass_through("act->observe")
 
-    return _emit_check(result) | {"current_observation": obs}
+    base = _emit_check(result)
+    base["current_observation"] = obs
+    if obligation_updates:
+        base["ledger_entries"] = base["ledger_entries"] + _record(*obligation_updates)["ledger_entries"]
+    return base
 
 
 def observe_think_check_node(state: ReCAPState) -> dict:
@@ -825,20 +902,35 @@ def repair_node(state: ReCAPState) -> dict:
     actions = latest.recovery_actions or []
 
     updated = {}
-    ledger: list[LedgerEntry] = []
+    ledger = []
 
     if RecoveryAction.PARAMETER_FIX in actions and cert is not None:
         # 参数收缩：将越界参数回落到约束允许范围（约束存在且为枚举时取首个）
         repaired_constraints = dict(cert.argument_constraints)
         new_cert = cert.model_copy(deep=True)
         updated["current_intent"] = new_cert
+        ledger.append(
+            RepairEntry(
+                description="parameter fix: shrink out-of-range arguments to constraints",
+                certificate_id=cert.certificate_id,
+                parameters_repaired=sorted(repaired_constraints),
+            )
+        )
 
     if RecoveryAction.PURIFY in actions and obs is not None:
         purified = _purify(obs.return_content)
         updated["current_observation"] = obs.model_copy(update={"return_content": purified})
+        ledger.append(
+            RepairEntry(
+                description="purify: strip control directives from low-trust observation",
+                certificate_id=cert.certificate_id if cert else "",
+            )
+        )
 
-    # no-op 透传：无需要修复的动作时不产生额外账本条目
-    return updated | {"ledger_entries": ledger}
+    if ledger:
+        updated["ledger_entries"] = _record(*ledger)["ledger_entries"]
+
+    return updated
 
 
 def replan_node(state: ReCAPState) -> dict:
@@ -868,6 +960,8 @@ def replan_node(state: ReCAPState) -> dict:
 
     updated = {}
     new_messages: list = []
+    cert = state.get("current_intent")
+    cert_id = cert.certificate_id if cert else ""
 
     if RecoveryAction.REPLAN in actions:
         # 标记证书 rejected，清理当前意图与动作，注入违规摘要要求重规划
@@ -900,6 +994,14 @@ def replan_node(state: ReCAPState) -> dict:
 
     if new_messages:
         updated["messages"] = new_messages
+    if actions:
+        updated["ledger_entries"] = _record(
+            ReplanEntry(
+                description="recovery actions applied: " + ", ".join(a.value for a in actions),
+                recovery_actions=list(actions),
+                certificate_id=cert_id,
+            )
+        )["ledger_entries"]
     return updated
 
 
@@ -967,6 +1069,19 @@ def route_after_observe_think_check(
     if RecoveryAction.BLOCK in actions or RecoveryAction.HUMAN_ESCALATION in actions:
         return "__end__"
     return "repair_node"
+
+
+def init_node(state: ReCAPState) -> dict:
+    """Step -1 | Init: 把任务定义写入账本（TaskEntry 当前从未入账）。"""
+    task = state.get("task_entry")
+    if task is None:
+        return {}
+    return _record(TaskEntry(
+        description=task.description,
+        policies=list(task.policies),
+        tools_available=list(task.tools_available),
+        initial_permissions=list(task.initial_permissions),
+    ))
 
 
 def build_recap_graph() -> StateGraph:
@@ -1038,6 +1153,7 @@ def build_recap_graph() -> StateGraph:
     graph = StateGraph(ReCAPState)
 
     # ── 核心步骤节点 ──
+    graph.add_node("init_node", init_node)
     graph.add_node("think_node", think_node)
     graph.add_node("think_act_check_node", think_act_check_node)
     graph.add_node("act_node", act_node)
@@ -1050,7 +1166,8 @@ def build_recap_graph() -> StateGraph:
     graph.add_node("replan_node", replan_node)
 
     # ── 入口 ──
-    graph.add_edge(START, "think_node")
+    graph.add_edge(START, "init_node")
+    graph.add_edge("init_node", "think_node")
 
     # ── Think 后路由：有 tool_calls 进入检查流水线，否则结束 ──
     graph.add_conditional_edges(

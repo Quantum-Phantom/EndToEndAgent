@@ -8,6 +8,7 @@ from recap.schemas import (
     ViolationType,
     RecoveryAction,
     ObligationStatus,
+    EvidenceType,
     # Core data models
     IntentCertificate,
     ActionEvent,
@@ -21,12 +22,15 @@ from recap.schemas import (
     ObservationEntry,
     ObligationEntry,
     ViolationEntry,
+    RepairEntry,
+    ReplanEntry,
     LedgerEntry,
 )
 
 from recap.graph import (
     ReCAPState,
     set_llm,
+    init_node,
     think_node,
     act_node,
     observe_node,
@@ -43,6 +47,16 @@ from recap.graph import (
     recap_graph_builder,
 )
 
+from recap.ledger import (
+    EvidenceDetector,
+    EVIDENCE_DETECTORS,
+    register_evidence,
+    collect_evidence,
+    LedgerStore,
+    get_ledger_store,
+    reset_ledger_store,
+)
+
 __all__ = [
     "TrustLevel",
     "DataSource",
@@ -50,6 +64,7 @@ __all__ = [
     "ViolationType",
     "RecoveryAction",
     "ObligationStatus",
+    "EvidenceType",
     "IntentCertificate",
     "ActionEvent",
     "ObservationEvent",
@@ -61,9 +76,12 @@ __all__ = [
     "ObservationEntry",
     "ObligationEntry",
     "ViolationEntry",
+    "RepairEntry",
+    "ReplanEntry",
     "LedgerEntry",
     "ReCAPState",
     "set_llm",
+    "init_node",
     "think_node",
     "act_node",
     "observe_node",
@@ -78,4 +96,11 @@ __all__ = [
     "route_after_observe_think_check",
     "build_recap_graph",
     "recap_graph_builder",
+    "EvidenceDetector",
+    "EVIDENCE_DETECTORS",
+    "register_evidence",
+    "collect_evidence",
+    "LedgerStore",
+    "get_ledger_store",
+    "reset_ledger_store",
 ]

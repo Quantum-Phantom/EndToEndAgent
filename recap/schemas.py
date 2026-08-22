@@ -107,6 +107,21 @@ class AuthorityBasis(str, Enum):
     VERIFIED_SESSION = "verified_session"
 
 
+class EvidenceType(str, Enum):
+    """证据类型——Think 阶段在 `required_evidence` 中声明的受控词表。
+
+    每项证据必须对应一个确定性检测器（见 recap.ledger.EVIDENCE_DETECTORS），
+    由来源工具 + 正则共同决定是否收集到。声明不在注册表中的证据将在
+    证书校验阶段被拒绝。
+    """
+
+    SESSION_TOKEN = "session_token"
+    ORDER_RETRIEVAL = "order_retrieval"
+    PUBLIC_STOCK = "public_stock"
+    REFUND_TICKET = "refund_ticket"
+    ESCALATION_CONFIRMATION = "escalation_confirmation"
+
+
 class ConstraintValueType(str, Enum):
     """约束值类型——argument_constraints 中每条约束的值的受控类型。
 
@@ -416,15 +431,17 @@ class IntentCertificate(BaseModel):
         + " / ".join(a.value for a in AuthorityBasis),
     )
     expected_effect: str = Field(..., min_length=1, description="预期效果：允许和禁止的状态变化")
-    required_evidence: list[str] = Field(
+    required_evidence: list[EvidenceType] = Field(
         default_factory=list,
-        description="执行后必须获得的回执或来源证明（如 delivery_receipt、state_diff）",
+        description="执行后必须获得的回执或来源证明（受控词表 EvidenceType）",
     )
 
-    @field_validator("required_evidence")
+    @field_validator("required_evidence", mode="after")
     @classmethod
-    def _ensure_unique_evidence(cls, v: list[str]) -> list[str]:
-        """确保证据列表去重。"""
+    def _ensure_known_evidence(
+        cls, v: list[EvidenceType],
+    ) -> list[EvidenceType]:
+        """确保证据列表去重且所有证据类型均已注册。"""
         return list(dict.fromkeys(v))
 
     def summary(self) -> str:
@@ -645,6 +662,26 @@ class ViolationEntry(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class RepairEntry(BaseModel):
+    """修复条目——repair_node 执行参数收缩/观测净化时写入账本。"""
+
+    entry_type: Literal["repair"] = Field(default="repair", frozen=True)
+    description: str = Field(..., min_length=1)
+    certificate_id: str = Field(default="", description="关联的意图证书 ID")
+    parameters_repaired: list[str] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ReplanEntry(BaseModel):
+    """重规划条目——replan_node 执行恢复时写入账本。"""
+
+    entry_type: Literal["replan"] = Field(default="replan", frozen=True)
+    description: str = Field(..., min_length=1)
+    recovery_actions: list[RecoveryAction] = Field(default_factory=list)
+    certificate_id: str = Field(default="", description="关联的意图证书 ID")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 # 共享账本条目的联合类型
 LedgerEntry = Union[
     TaskEntry,
@@ -653,4 +690,6 @@ LedgerEntry = Union[
     ObservationEntry,
     ObligationEntry,
     ViolationEntry,
+    RepairEntry,
+    ReplanEntry,
 ]
