@@ -46,7 +46,12 @@ from recap.schemas import (
     ViolationEvidence,
     ViolationType,
 )
-from recap.ledger import collect_evidence, get_ledger_store
+from recap.ledger import (
+    collect_evidence,
+    evidence_sources,
+    get_ledger_store,
+    source_tool_for,
+)
 from recap.tools import DeterministicToolError, TOOLS_BY_NAME
 
 # =============================================================================
@@ -235,6 +240,150 @@ def _check_least_privilege(
     return violations
 
 
+# 义务门槛重试上限：同一义务被 R-OBLIGATION-GATE 拦截达到上限后升级人工，
+# 防止"重规划-再拒绝"无限循环。
+_GATE_RETRY_LIMIT = 3
+
+# 无 tool_calls 但存在未闭合义务时的强制续跑上限（防虚假宣布完成的死循环）。
+_FORCED_CONTINUE_LIMIT = 3
+
+# ObligationEntry.description 的固定格式（见 observe_node）：解析证据名与产出工具。
+_OBLIGATION_DESC_RE = re.compile(r"evidence '(.+?)' from (.+)")
+
+
+def _pending_obligation_evidence() -> list[tuple[Any, EvidenceType, str]]:
+    """解析未闭合义务 => [(obligation, 证据类型, 产出工具)]；无法解析的跳过。"""
+    resolved: list[tuple[Any, EvidenceType, str]] = []
+    for obl in get_ledger_store().open_obligations():
+        m = _OBLIGATION_DESC_RE.match(obl.description)
+        if m is None:
+            continue
+        try:
+            evidence = EvidenceType(m.group(1))
+        except ValueError:
+            continue
+        resolved.append((obl, evidence, m.group(2)))
+    return resolved
+
+
+def _gate_violation_count(obligation_id: str) -> int:
+    """统计指定义务被 R-OBLIGATION-GATE 拦截的历史次数。"""
+    count = 0
+    for entry in get_ledger_store().entries:
+        if not isinstance(entry, ViolationEntry):
+            continue
+        v = entry.violation
+        if v.rule_id != "R-OBLIGATION-GATE":
+            continue
+        if any(obligation_id in line for line in v.evidence_chain):
+            count += 1
+    return count
+
+
+def _current_run_violation_count(rule_id: str) -> int:
+    """统计本次图运行内指定规则的违规次数。
+
+    以账本中最后一条 TaskEntry（init_node 每次运行写入）为运行边界，
+    避免持久化账本中历史运行的违规次数污染本轮的强制续跑上限。
+    """
+    entries = get_ledger_store().entries
+    run_start = 0
+    for i, entry in enumerate(entries):
+        if getattr(entry, "entry_type", "") == "task":
+            run_start = i + 1
+    return sum(
+        1
+        for entry in entries[run_start:]
+        if isinstance(entry, ViolationEntry) and entry.violation.rule_id == rule_id
+    )
+
+
+def _check_evidence_feasibility(cert: IntentCertificate) -> list[ViolationEvidence]:
+    """检查 e: required_evidence 必须可由 proposed_operation 产出。
+
+    证据检测器按来源工具绑定（EVIDENCE_DETECTORS）；若证书声明的证据不能由
+    拟执行工具产生，则该义务永远无法闭环，必须在 Think→Act 阶段确定性拒绝。
+    """
+    violations: list[ViolationEvidence] = []
+    producible = sorted(e.value for e in evidence_sources().get(cert.proposed_operation, []))
+    for evidence in cert.required_evidence:
+        if evidence.value in producible:
+            continue
+        violations.append(
+            ViolationEvidence(
+                violation_type=ViolationType.INTENT_VIOLATION,
+                rule_id="R-EVIDENCE-FEASIBLE",
+                rule_description=(
+                    f"required evidence '{evidence.value}' cannot be produced by "
+                    f"'{cert.proposed_operation}'; declare only evidence the operation can "
+                    f"produce (producible: {producible})"
+                ),
+                intent_field="required_evidence",
+                expected_value=f"one of {producible}" if producible else "none",
+                actual_value=evidence.value,
+                decision=RecoveryAction.REPLAN,
+                evidence_chain=[
+                    f"Intent: proposed_operation = {cert.proposed_operation}",
+                    f"Intent: required_evidence includes '{evidence.value}'",
+                    f"Detector binding: source_tool('{evidence.value}') = "
+                    f"'{source_tool_for(evidence) or 'unregistered'}'",
+                ],
+            )
+        )
+    return violations
+
+
+def _check_open_obligations(cert: IntentCertificate) -> list[ViolationEvidence]:
+    """检查 f: 未闭合证据义务未满足前禁止切换子目标。
+
+    - 新证书的操作不是缺失证据的产出工具 -> REPLAN（必须先回到产出工具）；
+    - 操作正确但未把该证据列入 required_evidence -> REPLAN（防止用空列表绕过）；
+    - 同一义务被拦截达到 _GATE_RETRY_LIMIT -> HUMAN_ESCALATION（防死锁）。
+    """
+    violations: list[ViolationEvidence] = []
+    declared = {e.value for e in cert.required_evidence}
+    for obl, evidence, producing_tool in _pending_obligation_evidence():
+        if producing_tool == cert.proposed_operation and evidence.value in declared:
+            continue
+        retries = _gate_violation_count(obl.obligation_id)
+        decision = (
+            RecoveryAction.HUMAN_ESCALATION
+            if retries >= _GATE_RETRY_LIMIT
+            else RecoveryAction.REPLAN
+        )
+        if producing_tool != cert.proposed_operation:
+            reason = (
+                f"outstanding obligation requires evidence '{evidence.value}' which is only "
+                f"produced by '{producing_tool}'; call '{producing_tool}' before switching to "
+                f"'{cert.proposed_operation}'"
+            )
+        else:
+            reason = (
+                f"you are calling '{cert.proposed_operation}' but did not declare the "
+                f"outstanding evidence '{evidence.value}' in required_evidence; declaring it is "
+                "mandatory until the obligation closes"
+            )
+        violations.append(
+            ViolationEvidence(
+                violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
+                rule_id="R-OBLIGATION-GATE",
+                rule_description=reason,
+                intent_field="subgoal",
+                expected_value=(
+                    f"{producing_tool} with required_evidence including '{evidence.value}'"
+                ),
+                actual_value=cert.proposed_operation,
+                decision=decision,
+                evidence_chain=[
+                    f"Obligation: {obl.obligation_id} ({obl.description}) "
+                    f"status={obl.status.value}",
+                    f"retry count = {retries}/{_GATE_RETRY_LIMIT}",
+                ],
+            )
+        )
+    return violations
+
+
 # =============================================================================
 # 指令/注入检测启发式（确定性）
 # =============================================================================
@@ -304,6 +453,7 @@ class ReCAPState(MessagesState):
         current_intent      — 本轮 Think 提交的意图证书。
         current_action      — 本轮工具调用事件。
         current_observation — 本轮环境返回观测。
+        cert_parse_error    — 本轮证书解析/校验失败原因（供 think->act 检查反馈）。
         ledger_entries      — 共享契约与证据账本（追加写入，不可覆盖）。
         check_results       — 历次阶段检查结果（追加写入）。
     """
@@ -313,6 +463,7 @@ class ReCAPState(MessagesState):
     current_intent: NotRequired[IntentCertificate | None]
     current_action: NotRequired[ActionEvent | None]
     current_observation: NotRequired[ObservationEvent | None]
+    cert_parse_error: NotRequired[str | None]
     ledger_entries: NotRequired[Annotated[list[LedgerEntry], add]]
     check_results: NotRequired[Annotated[list[TransitionResult], add]]
 
@@ -339,12 +490,30 @@ def think_node(state: ReCAPState) -> dict:
     # 收集本轮尚未完成的义务，注入为显式约束提示（按 obligation_id
     # 去重取最新状态，避免历史 PENDING 条目掩盖已闭合的义务）。
     pending_obligations = get_ledger_store().open_obligations()
+    pending_resolved = _pending_obligation_evidence()
     obligation_hint = ""
     if pending_obligations:
-            obligation_hint = (
-            "\nOutstanding evidence obligations (do not falsely claim success):\n"
-            + "\n".join(f"- {o.description}" for o in pending_obligations)
+        if pending_resolved:
+            detail_lines = [
+                f"- evidence '{evidence.value}' must be produced by tool '{tool}'"
+                for _, evidence, tool in pending_resolved
+            ]
+        else:
+            detail_lines = [f"- {o.description}" for o in pending_obligations]
+        obligation_hint = (
+            "\nOutstanding evidence obligations (BLOCKING; do not falsely claim success and do "
+            "not switch to another subgoal):\n"
+            + "\n".join(detail_lines)
+            + "\nYour next certificate MUST call the producing tool above and MUST list the "
+            "missing evidence in required_evidence.\n"
         )
+
+    # 证据产出能力表：让 LLM 只声明拟执行工具真正能产生的证据类型，
+    # 避免"声明不可产出证据 -> 永久 EVIDENCE_INSUFFICIENT"死循环。
+    evidence_map_hint = "\n".join(
+        f"  - {tool}: {[e.value for e in evs]}"
+        for tool, evs in sorted(evidence_sources().items())
+    )
 
     # 上轮净化数据（若有）作为纯事实供本轮规划引用
     prev_obs = state.get("current_observation")
@@ -378,6 +547,9 @@ def think_node(state: ReCAPState) -> dict:
         "ARRAY of allowed values (value must be an array, e.g. [\"O001\"]); a bare string value is strictly forbidden.\n"
         "- required_evidence must be present as a JSON array (possibly empty []), "
         "drawn from the controlled EvidenceType vocabulary. \n"
+        "  You may only declare evidence that your proposed_operation can actually produce:\n"
+        f"{evidence_map_hint}\n"
+        "  Declaring evidence not producible by the proposed_operation will be rejected.\n"
         "Complete example:\n"
         "```json\n"
         "{\n"
@@ -402,6 +574,7 @@ def think_node(state: ReCAPState) -> dict:
 
     ai_message: AIMessage | None = None
     cert: IntentCertificate | None = None
+    cert_parse_error: str | None = None
 
     if _llm_has_tools():
         response = _llm.invoke(messages)
@@ -417,13 +590,18 @@ def think_node(state: ReCAPState) -> dict:
         data = extract_certificate(ai_message.content or "")
         if data is None:
             missing: list[str] = []
+            if (ai_message.content or "").strip():
+                cert_parse_error = "no parsable intent certificate JSON found in reply text"
         else:
             missing = _missing_cert_fields(data)
             if not missing:
                 try:
                     cert = IntentCertificate.model_validate(data)
-                except Exception:
+                except Exception as e:  # noqa: BLE001
                     cert = None
+                    # 保留具体校验失败原因，供 think->act 检查给出可行动反馈，
+                    # 而非误导性的 "No valid certificate or tool_calls present"。
+                    cert_parse_error = f"{type(e).__name__}: {e}"
 
     # 单次工具调用策略：每轮仅保留第一个 tool_call（若有），其余丢弃，
     # 保证 Act→Observe 阶段一对一对应，无需多路绑定校验。
@@ -436,6 +614,7 @@ def think_node(state: ReCAPState) -> dict:
     return {
         "round_num": round_num,
         "current_intent": cert,
+        "cert_parse_error": cert_parse_error,
         "messages": [ai_message] if ai_message is not None else [],
         "ledger_entries": _record(*ledger)["ledger_entries"],
     }
@@ -446,13 +625,15 @@ def think_act_check_node(state: ReCAPState) -> dict:
 
     职责：
     1. 加载意图证书和实际工具调用参数。
-    2. 四项确定性检查：
+    2. 六项确定性检查：
        a. 操作是否服务于声明子目标（工具名/语义对齐）。
        b. 实际参数是否落在 argument_constraints 允许范围。
        c. 授权 authority_basis 是否真实且未失效。
        d. 是否遵循最小权限原则。
+       e. required_evidence 是否可由 proposed_operation 产出（R-EVIDENCE-FEASIBLE）。
+       f. 存在未闭合义务时禁止切换子目标（R-OBLIGATION-GATE）。
     3. 违规恢复：参数越界 -> PARAMETER_FIX 自动收缩；
-       目标/授权问题 -> REPLAN 回 think_node；
+       目标/授权/证据可行性问题 -> REPLAN 回 think_node；
        高风险未知 -> BLOCK + HUMAN_ESCALATION。
 
     输入: state["current_intent"], state["messages"][-1].tool_calls
@@ -469,12 +650,16 @@ def think_act_check_node(state: ReCAPState) -> dict:
             break
 
     if cert is None or latest_ai is None:
+        details = ["No valid certificate or tool_calls present"]
+        parse_err = state.get("cert_parse_error")
+        if cert is None and latest_ai is not None and parse_err:
+            details.append(f"certificate validation failed -> {parse_err}")
         violation = ViolationEvidence(
             violation_type=ViolationType.INTENT_VIOLATION,
             rule_id="R-CERT-REQUIRED",
             rule_description="a valid intent certificate and tool_calls are required before acting",
             decision=RecoveryAction.REPLAN,
-            evidence_chain=["No valid certificate or tool_calls present"],
+            evidence_chain=details,
         )
         result = TransitionResult.blocked(
             "think->act", [violation], [RecoveryAction.REPLAN]
@@ -500,6 +685,10 @@ def think_act_check_node(state: ReCAPState) -> dict:
     auth_v = _check_authority(cert)
     if auth_v:
         violations.append(auth_v)
+
+    # 证书级检查：证据可行性与未闭合义务门槛（不依赖具体 tool_call 参数）
+    violations.extend(_check_evidence_feasibility(cert))
+    violations.extend(_check_open_obligations(cert))
 
     if violations:
         # 决策映射：存在 BLOCK 则阻断；否则参数级修复优先
@@ -782,6 +971,27 @@ def act_observe_check_node(state: ReCAPState) -> dict:
                     )
                 )
 
+        # 语义闭环：只要证据已实际收集且来源工具匹配，历史遗留的同义
+        # PENDING 义务（例如上一份证书重试前留下的）一并关闭，避免换新
+        # 证书重试后旧义务永久悬挂、阻断后续所有子目标。
+        closed_ids = {u.obligation_id for u in obligation_updates}
+        for obl, evidence_type, producer in _pending_obligation_evidence():
+            if producer != action.tool_name or evidence_type not in collected:
+                continue
+            if obl.obligation_id in closed_ids:
+                continue
+            closed_ids.add(obl.obligation_id)
+            obligation_updates.append(
+                ObligationEntry(
+                    obligation_id=obl.obligation_id,
+                    description=obl.description,
+                    certificate_id=obl.certificate_id,
+                    status=ObligationStatus.FULFILLED,
+                    created_at=obl.created_at,
+                    fulfilled_at=datetime.now(timezone.utc),
+                )
+            )
+
     # 2. 效果可观测性：state_diff 不可观测时不伪造成功/完成
     obs.is_complete = bool(not violations and not failed)
 
@@ -861,17 +1071,26 @@ def observe_think_check_node(state: ReCAPState) -> dict:
 
 
 def should_continue_after_think(state: ReCAPState) -> Literal["think_act_check_node", "__end__"]:
-    """Think 后路由: 有 tool_calls -> think_act_check_node / 否则 -> END。
+    """Think 后路由: 有 tool_calls -> think_act_check_node / 否则视义务决定能否结束。
 
-    检查最新 AIMessage 是否包含 tool_calls：
-    - 有 -> 进入 think_act_check_node（启动检查流水线）
-    - 无 -> END（Agent 已完成任务或给出最终回复）
+    - 有 tool_calls -> 进入检查流水线。
+    - 无 tool_calls 但账本中仍有未闭合证据义务 -> 不允许直接结束（防止在义务
+      未闭环时虚假宣布完成），强制走一轮 R-CERT-REQUIRED -> REPLAN 回 think；
+      强制续跑达到 _FORCED_CONTINUE_LIMIT 次后放行结束，避免无限循环。
+    - 无 tool_calls 且无未闭合义务 -> END（Agent 已完成任务或给出最终回复）。
     """
+    latest_ai = None
     for m in reversed(state.get("messages", [])):
         if isinstance(m, AIMessage):
-            if m.tool_calls:
-                return "think_act_check_node"
-            return "__end__"
+            latest_ai = m
+            break
+
+    if latest_ai is not None and latest_ai.tool_calls:
+        return "think_act_check_node"
+
+    if _pending_obligation_evidence():
+        if _current_run_violation_count("R-CERT-REQUIRED") < _FORCED_CONTINUE_LIMIT:
+            return "think_act_check_node"
     return "__end__"
 
 
@@ -979,9 +1198,18 @@ def replan_node(state: ReCAPState) -> dict:
         )
 
     if RecoveryAction.KEEP_UNFINISHED in actions:
+        detail_lines = [
+            f"- missing evidence '{evidence.value}', must be produced by tool '{tool}'"
+            for _, evidence, tool in _pending_obligation_evidence()
+        ]
+        detail = ("\n缺失证据明细:\n" + "\n".join(detail_lines)) if detail_lines else ""
         new_messages.append(
             SystemMessage(
-                content="检测到证据义务未完成。任务尚未成功，禁止虚假宣布完成，请继续收集所需证据。"
+                content=(
+                    "检测到证据义务未完成。任务尚未成功，禁止虚假宣布完成，"
+                    "禁止切换到其他子目标，请先用对应工具收集所需证据。"
+                    f"{detail}"
+                )
             )
         )
 

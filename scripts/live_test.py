@@ -28,6 +28,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
 
 from recap.graph import build_recap_graph, set_llm
 from recap.schemas import TaskEntry, TrustLevel
@@ -86,7 +87,7 @@ def main() -> int:
         tools_available=list(TOOLS_BY_NAME),
         initial_permissions=["verify_identity", "lookup_order", "check_inventory"],
     )
-    graph = build_recap_graph().compile()
+    graph = build_recap_graph().compile(checkpointer=MemorySaver())
 
     user_request = (
         "我是客户 Alice Wang，电话 555-0101，邮箱 alice@example.com，"
@@ -99,8 +100,8 @@ def main() -> int:
     print("用户请求:", user_request)
     print("=" * 70)
 
-    config = {"recursion_limit": 50}
-    # result = None
+    config = {"recursion_limit": 50, "configurable": {"thread_id": "live-test-1"}}
+    result = None
     last_snapshot: dict | None = None
     try:
         for chunk in graph.stream(
@@ -121,7 +122,7 @@ def main() -> int:
                     if isinstance(content, list):
                         content = " ".join(str(c) for c in content)
                     print(f"[{node}] [{role}] {str(content)}")
-        # result = graph.get_state(config).values
+        result = graph.get_state(config).values
     except Exception as e:
         print(f"\n[错误] 图执行失败: {type(e).__name__}: {e}")
         print("--- 出错前已累积的输出 ---")
@@ -133,7 +134,7 @@ def main() -> int:
         _print_state(last_snapshot, include_messages=True)
         raise
 
-    # _print_state(result) if result is not None else None
+    _print_state(result) if result is not None else None
     return 0
 
 

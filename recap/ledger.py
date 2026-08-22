@@ -57,6 +57,24 @@ def register_evidence(name: EvidenceType, source_tool: str, pattern: str) -> Non
     EVIDENCE_DETECTORS[name] = EvidenceDetector(source_tool, pattern)
 
 
+def evidence_sources() -> dict[str, list[EvidenceType]]:
+    """返回 tool_name -> 可产出证据类型列表 的映射（由 EVIDENCE_DETECTORS 推导）。
+
+    供 think_node 注入提示词与 think_act_check_node 做证据可行性检查：
+    required_evidence 中声明的证据必须能由 proposed_operation 产出。
+    """
+    sources: dict[str, list[EvidenceType]] = {}
+    for evidence, detector in EVIDENCE_DETECTORS.items():
+        sources.setdefault(detector.source_tool, []).append(evidence)
+    return sources
+
+
+def source_tool_for(evidence: EvidenceType) -> str:
+    """返回能产出指定证据类型的来源工具名（未注册时返回空字符串）。"""
+    detector = EVIDENCE_DETECTORS.get(evidence)
+    return detector.source_tool if detector is not None else ""
+
+
 def collect_evidence(action: Any, observation: Any) -> dict[EvidenceType, str]:
     """检测给定动作对应的观测中收集到的证据。
 
