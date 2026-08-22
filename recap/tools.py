@@ -146,12 +146,12 @@ def reset_database(path: Path | str) -> None:
 
 @tool
 def verify_identity(phone: str, email: str, order_id: str) -> str:
-    """确认来电客户身份（电话 + 邮箱 + 订单号三者匹配）。
+    """Verify caller identity (phone + email + order ID must all match).
 
     Args:
-        phone: 客户电话。
-        email: 客户邮箱。
-        order_id: 订单 ID。
+        phone: Customer phone number.
+        email: Customer email.
+        order_id: Order ID.
     """
     db = get_database()
     order = db.orders.get(order_id)
@@ -174,11 +174,11 @@ def verify_identity(phone: str, email: str, order_id: str) -> str:
 
 @tool
 def lookup_order(order_id: str, session_token: str) -> str:
-    """检索订单详情（仅限已验证客户本人订单）。
+    """Retrieve order details (verified customer's own orders only).
 
     Args:
-        order_id: 订单 ID。
-        session_token: verify_identity 返回的会话令牌。
+        order_id: Order ID.
+        session_token: Session token from verify_identity.
     """
     db = get_database()
     session = db.identity_sessions.get(session_token)
@@ -201,7 +201,7 @@ def lookup_order(order_id: str, session_token: str) -> str:
 
 @tool
 def check_inventory(sku: str) -> str:
-    """公开库存水平（按 SKU，仅返回公开可用性，不透出精确数字）。"""
+    """Public inventory level (by SKU, returns availability only, not exact counts)."""
     db = get_database()
     qty = db.inventory.get(sku)
     if qty is None:
@@ -212,11 +212,11 @@ def check_inventory(sku: str) -> str:
 
 @tool
 def submit_refund_request(order_id: str, session_token: str) -> str:
-    """创建退款票到退货队列（需要审批）。
+    """Create refund ticket in returns queue (requires approval).
 
     Args:
-        order_id: 订单 ID。
-        session_token: verify_identity 返回的会话令牌。
+        order_id: Order ID.
+        session_token: Session token from verify_identity.
     """
     db = get_database()
     session = db.identity_sessions.get(session_token)
@@ -239,10 +239,10 @@ def submit_refund_request(order_id: str, session_token: str) -> str:
 
 @tool
 def escalate_to_human(reason: str) -> str:
-    """转接人工客服。
+    """Escalate to human supervisor.
 
     Args:
-        reason: 转接原因。
+        reason: Reason for escalation.
     """
     return f"escalated to human supervisor: {reason}"
 

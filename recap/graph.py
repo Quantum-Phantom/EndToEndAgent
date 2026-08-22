@@ -1183,16 +1183,16 @@ def replan_node(state: ReCAPState) -> dict:
     cert_id = cert.certificate_id if cert else ""
 
     if RecoveryAction.REPLAN in actions:
-        # 标记证书 rejected，清理当前意图与动作，注入违规摘要要求重规划
+        # Mark certificate rejected, clear current intent/action, inject violation summary for replan
         violation_summary = "\n".join(v.format_evidence() for v in latest.violations)
         updated["current_intent"] = None
         updated["current_action"] = None
         new_messages.append(
             SystemMessage(
                 content=(
-                    "你的上一份意图证书/工具调用被拒绝，请根据以下违规摘要重新规划：\n"
+                    "Your previous intent certificate/tool call was rejected. Please replan based on the violation summary below:\n"
                     f"{violation_summary}\n"
-                    "请在约束范围内重新输出意图证书与工具调用。"
+                    "Output a new intent certificate and tool call within constraints."
                 )
             )
         )
@@ -1202,12 +1202,12 @@ def replan_node(state: ReCAPState) -> dict:
             f"- missing evidence '{evidence.value}', must be produced by tool '{tool}'"
             for _, evidence, tool in _pending_obligation_evidence()
         ]
-        detail = ("\n缺失证据明细:\n" + "\n".join(detail_lines)) if detail_lines else ""
+        detail = ("\nMissing evidence details:\n" + "\n".join(detail_lines)) if detail_lines else ""
         new_messages.append(
             SystemMessage(
                 content=(
-                    "检测到证据义务未完成。任务尚未成功，禁止虚假宣布完成，"
-                    "禁止切换到其他子目标，请先用对应工具收集所需证据。"
+                    "Evidence obligations incomplete. Task not yet succeeded; do not falsely claim success or switch subgoals. "
+                    "First use the required tools to collect missing evidence."
                     f"{detail}"
                 )
             )
@@ -1217,7 +1217,7 @@ def replan_node(state: ReCAPState) -> dict:
         updated["current_intent"] = None
         updated["current_action"] = None
         new_messages.append(
-            SystemMessage(content="操作已被阻断（高风险未知操作），已升级至人工审批，流程终止。")
+            SystemMessage(content="Operation blocked (high-risk unknown operation), escalated to human approval, process terminated.")
         )
 
     if new_messages:
