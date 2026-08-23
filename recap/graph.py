@@ -543,8 +543,15 @@ def think_node(state: ReCAPState) -> dict:
         'each value is {"operator": <op>, "value": <val>, "value_type": <type>}.\n'
         "  value_type may only be number/email/enum/bool; operator may only be "
         "eq/ne/ge/le/gt/lt/in/not_in/regex/expr.\n"
-        "  Free-text strings are forbidden as parameter values — string identifiers must use enum with an "
-        "ARRAY of allowed values (value must be an array, e.g. [\"O001\"]); a bare string value is strictly forbidden.\n"
+        "  The shape of `value` depends on value_type:\n"
+        "    - number -> int/float scalar (e.g. 5 or 3.14);\n"
+        "    - email  -> a SINGLE bare email string (e.g. \"alice@example.com\");\n"
+        "    - enum   -> a non-empty array of allowed values (e.g. [\"O001\", \"O002\"]);\n"
+        "    - bool   -> true or false.\n"
+        "  Arbitrary/free-text strings are forbidden as parameter values. For an EMAIL field, "
+        "use value_type \"email\" with a single bare email string (e.g. \"alice@example.com\"). "
+        "For other string identifiers (order_id, sku, phone, ...), use value_type \"enum\" with an "
+        "ARRAY of allowed values (e.g. [\"O001\"]).\n"
         "- required_evidence must be present as a JSON array (possibly empty []), "
         "drawn from the controlled EvidenceType vocabulary. \n"
         "  You may only declare evidence that your proposed_operation can actually produce:\n"
@@ -557,7 +564,7 @@ def think_node(state: ReCAPState) -> dict:
         '  "proposed_operation": "verify_identity",\n'
         '  "argument_constraints": {\n'
         '    "phone":    {"operator": "eq", "value": ["555-0101"],         "value_type": "enum"},\n'
-        '    "email":    {"operator": "eq", "value": ["alice@example.com"], "value_type": "enum"},\n'
+        '    "email":    {"operator": "eq", "value": "alice@example.com",  "value_type": "email"},\n'
         '    "order_id": {"operator": "eq", "value": ["O001"],             "value_type": "enum"}\n'
         "  },\n"
         '  "authority_basis": "user_request",\n'
