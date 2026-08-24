@@ -3,8 +3,6 @@
 本模块实现 scenario.md 中的电商订单客服场景所需的 5 个工具，以及一个
 基于内存 + JSONL 文件持久化的零售数据库。所有工具满足以下可观测性要求：
 
-  - 每次调用返回 (result, state_diff) 二元组，其中 state_diff 描述执行前后
-    可观测的状态变化，供 Act→Observe 检查比较预期效果；
   - 违反边界时抛 DeterministicToolError，由 Trusted Tool Wrapper 捕获并
     记录为 BLOCKED，而不是静默返回错误结果。
 
@@ -40,7 +38,7 @@ class RetailDatabase:
     """零售数据库：订单、库存、客户三张表 + 退款票队列。
 
     数据持久化到 JSONL 文件（每行一张表的快照记录），加载时重建内存索引；
-    写入采用追加方式（append-only），支持 state_diff 追踪与实验重放。
+    写入采用追加方式（append-only），支持实验重放。
     """
 
     path: Path = field(default_factory=lambda: _DEFAULT_DB_PATH)
@@ -112,12 +110,6 @@ class RetailDatabase:
             self._snapshot("customers", self.customers)
             self._snapshot("orders", self.orders)
             self._snapshot("inventory", self.inventory)
-
-    # -- 状态差分辅助 ---------------------------------------------------
-
-    @staticmethod
-    def _diff(table: str, before: Any, after: Any) -> dict[str, Any]:
-        return {"table": table, "before": before, "after": after}
 
 
 # =============================================================================

@@ -751,7 +751,6 @@ def think_act_check_node(state: ReCAPState) -> dict:
                 check_type="think->act",
                 violations=violations,
                 recovery_actions=[RecoveryAction.PARAMETER_FIX],
-                next_allowed=True,
             )
         else:
             result = TransitionResult.blocked("think->act", violations, [RecoveryAction.REPLAN])
@@ -942,7 +941,7 @@ def act_observe_check_node(state: ReCAPState) -> dict:
     输入: state["current_action"], state["current_observation"],
           state["current_intent"].required_evidence
     输出: check_results, ledger_entries (ObligationEntry/ViolationEntry),
-          current_observation (可能更新 is_complete/state_diff)
+          current_observation (可能更新 is_complete)
     路由: 通过 -> observe_think_check_node / 违规 -> think_node 或 END
     """
     action = state.get("current_action")
@@ -1042,7 +1041,7 @@ def act_observe_check_node(state: ReCAPState) -> dict:
                 )
             )
 
-    # 2. 效果可观测性：state_diff 不可观测时不伪造成功/完成
+    # 2. 效果可观测性：证据不足时不伪造成功/完成
     obs.is_complete = bool(not violations and not failed)
 
     if violations:
@@ -1064,7 +1063,7 @@ def observe_think_check_node(state: ReCAPState) -> dict:
     1. 按来源切分 Observation (HIGH/MEDIUM/LOW)。
     2. 净化低信任内容：允许作为数据事实引用，禁止作为控制指令。
     3. 比较新旧目标与权限：目标变化须追溯用户授权；权限只缩不扩。
-    4. 生成净化观察 purified_observation。
+    4. 净化结果直接写回 current_observation。
     5. 检测注入 -> 生成 ViolationEvidence(OBSERVATION_POLLUTION)。
 
     输入: state["current_observation"], state["current_intent"]
@@ -1105,16 +1104,12 @@ def observe_think_check_node(state: ReCAPState) -> dict:
             check_type="observe->think",
             violations=violations,
             recovery_actions=[RecoveryAction.PURIFY],
-            purified_observation=purified,
-            next_allowed=True,
         )
     else:
         result = TransitionResult(
             passed=True,
             check_type="observe->think",
             violations=[],
-            purified_observation=purified,
-            next_allowed=True,
         )
 
     return _emit_check(result) | {"current_observation": obs.model_copy(update={"return_content": purified})}
@@ -1152,7 +1147,7 @@ def repair_node(state: ReCAPState) -> dict:
     2. PARAMETER_FIX：将越界参数收缩到 argument_constraints 允许范围内，
        更新 current_intent 中的参数约束，追加 RepairEntry 到 ledger_entries。
     3. PURIFY：对低信任 Observation 进行净化——剥离控制指令，
-       保留带来源标签的数据事实，填充 purified_observation。
+       保留带来源标签的数据事实，直接更新 current_observation。
     4. 对不需要修复的状态（如通过检查后进入），作为 no-op 透传。
 
     输入: state["check_results"][-1], state["current_intent"],

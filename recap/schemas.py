@@ -454,13 +454,6 @@ class IntentCertificate(BaseModel):
         """确保证据列表去重且所有证据类型均已注册。"""
         return list(dict.fromkeys(v))
 
-    def summary(self) -> str:
-        """生成人类可读的证书摘要。"""
-        return (
-            f"[Cert {self.certificate_id}] Round {self.round_num}: "
-            f"'{self.subgoal}' via {self.proposed_operation}"
-        )
-
 
 # =============================================================================
 # 2.2 动作事件 (Action Event)
@@ -504,10 +497,6 @@ class ObservationEvent(BaseModel):
 
     call_id: str = Field(..., min_length=1)
     return_content: Any = Field(default=None)
-    state_diff: dict[str, Any] | None = Field(
-        default=None,
-        description="执行前后状态差分，若无法观察则为 None",
-    )
     evidence_collected: list[str] = Field(default_factory=list)
     data_source: DataSource = Field(default=DataSource.TOOL)
     trust_level: TrustLevel = Field(default=TrustLevel.MEDIUM)
@@ -583,16 +572,11 @@ class TransitionResult(BaseModel):
     )
     violations: list[ViolationEvidence] = Field(default_factory=list)
     recovery_actions: list[RecoveryAction] = Field(default_factory=list)
-    purified_observation: Any = Field(
-        default=None,
-        description="净化后的 Observation，仅 observe->think 检查后填充",
-    )
-    next_allowed: bool = Field(default=True, description="是否允许进入下一阶段")
 
     @classmethod
     def pass_through(cls, check_type: str) -> "TransitionResult":
         """创建通过结果。"""
-        return cls(passed=True, check_type=check_type, next_allowed=True)
+        return cls(passed=True, check_type=check_type)
 
     @classmethod
     def blocked(
@@ -607,7 +591,6 @@ class TransitionResult(BaseModel):
             check_type=check_type,
             violations=violations,
             recovery_actions=recovery_actions or [v.decision for v in violations],
-            next_allowed=False,
         )
 
 
