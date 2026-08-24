@@ -534,6 +534,10 @@ def think_node(state: ReCAPState) -> dict:
         "argument_constraints, authority_basis, expected_effect, "
         "required_evidence. The certificate must be placed inside ```json ... ``` fences, "
         "and you must simultaneously issue exactly one tool_calls.\n"
+        "NOTE for reasoning/tool-calling models: the ```json``` certificate block MUST appear in "
+        "visible reply content. Do not leave content empty and put the certificate only in hidden "
+        "reasoning tokens; the safety check can only read visible content. If you emit only a "
+        "tool_call with empty content, the turn will be rejected as certificate-missing.\n"
         "- proposed_operation must EXACTLY equal one of the tool names available for this task "
         "and match the tool name issued in the actual tool_calls.\n"
         "- authority_basis must be chosen from the controlled vocabulary: "
@@ -594,10 +598,26 @@ def think_node(state: ReCAPState) -> dict:
     # current_intent，否则 think->act 检查会用陈旧 proposed_operation 与
     # 本轮实际 tool_calls 比对，产生误拒（stale-state bug）。
     if ai_message is not None:
-        data = extract_certificate(ai_message.content or "")
+        content_text = ai_message.content or ""
+        data = extract_certificate(content_text)
         if data is None:
             missing: list[str] = []
-            if (ai_message.content or "").strip():
+            # 始终为证书缺失生成可行动反馈，并区分「空文本」与「有文本但不可解析」，
+            # 尤其针对推理/工具调用模型在发起 tool_calls 时 content 为空的情况：
+            # 它们的思考落在隐藏 reasoning_tokens 中，可见 content 必须仍包含证书块。
+            if not content_text.strip():
+                if ai_message.tool_calls:
+                    cert_parse_error = (
+                        "reply text is empty while a tool call was issued; the intent "
+                        "certificate JSON block must appear in visible content alongside "
+                        "the tool call (reasoning tokens are not visible to the safety check)"
+                    )
+                else:
+                    cert_parse_error = (
+                        "reply text is empty and no tool call was made; output the "
+                        "intent certificate JSON block in visible content and issue one tool call"
+                    )
+            else:
                 cert_parse_error = "no parsable intent certificate JSON found in reply text"
         else:
             missing = _missing_cert_fields(data)
@@ -657,14 +677,31 @@ def think_act_check_node(state: ReCAPState) -> dict:
             break
 
     if cert is None or latest_ai is None:
-        details = ["No valid certificate or tool_calls present"]
         parse_err = state.get("cert_parse_error")
-        if cert is None and latest_ai is not None and parse_err:
-            details.append(f"certificate validation failed -> {parse_err}")
+        # 区分两种本质不同的失败，给出可行动的证据链，而非误导性的统一文案：
+        #   - latest_ai is None: 根本没有 tool_calls（未发起动作）
+        #   - latest_ai 有 tool_calls 但 cert is None: 发起了工具调用却缺少证书
+        # 后者正是推理/工具调用模型将思考留在 reasoning_tokens、可见 content 为空
+        # 时的真实表现；必须明确指出「工具调用已发出但证书缺失」，避免下一轮
+        # replan 反馈自相矛盾（旧文案称 "No ... tool_calls present"）。
+        if latest_ai is None:
+            details = ["No tool_calls present; a tool call is required to act."]
+            actual = "no tool_calls"
+        else:
+            details = [
+                "A tool call was issued but no valid intent certificate was found in the "
+                "reply text; output the ```json``` certificate block in visible content AND "
+                "the tool call in the same turn (reasoning tokens are not visible to the "
+                "safety check)."
+            ]
+            actual = "tool_calls present, certificate absent"
+            if cert is None and parse_err:
+                details.append(f"certificate validation failed -> {parse_err}")
         violation = ViolationEvidence(
             violation_type=ViolationType.INTENT_VIOLATION,
             rule_id="R-CERT-REQUIRED",
             rule_description="a valid intent certificate and tool_calls are required before acting",
+            actual_value=actual,
             decision=RecoveryAction.REPLAN,
             evidence_chain=details,
         )

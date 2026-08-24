@@ -181,6 +181,67 @@ class TestThinkActCheck(unittest.TestCase):
         # 无 tool_calls，无法验证 op scope，走证书必填分支
         self.assertFalse(out["check_results"][0].passed)
 
+    def test_tool_call_without_certificate_diagnostic(self):
+        # 复现推理/工具调用模型的核心 bug：发起了合法 tool_call 但 content 为空，
+        # 因此证书解析为 None。检查节点须给出「工具调用已发出但证书缺失」的
+        # 可行动反馈，而非旧的自相矛盾文案 "No valid certificate or tool_calls present"。
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        reset_ledger_store(Path(tmp.name) / "ledger.jsonl")
+        ai = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "verify_identity",
+                    "args": {"phone": "555-0101", "email": "alice@example.com", "order_id": "O001"},
+                    "id": "call-1",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        state = {
+            "current_intent": None,
+            "cert_parse_error": (
+                "reply text is empty while a tool call was issued; the intent "
+                "certificate JSON block must appear in visible content alongside the tool call"
+            ),
+            "task_entry": make_task(),
+            "messages": [ai],
+        }
+        out = think_act_check_node(state)
+        result = out["check_results"][0]
+        self.assertFalse(result.passed)
+        self.assertIn(RecoveryAction.REPLAN, result.recovery_actions)
+        v = result.violations[0]
+        self.assertEqual(v.rule_id, "R-CERT-REQUIRED")
+        chain = " ".join(v.evidence_chain)
+        self.assertIn("tool call was issued but no valid intent certificate", chain)
+        # 旧误导性文案不应再出现
+        self.assertNotIn("No valid certificate or tool_calls present", chain)
+        self.assertEqual(v.actual_value, "tool_calls present, certificate absent")
+
+    def test_no_tool_calls_diagnostic(self):
+        # 真正未发起任何工具调用时，证据链应明确指出 "No tool_calls present"。
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        reset_ledger_store(Path(tmp.name) / "ledger.jsonl")
+        ai = AIMessage(content="好的，我来帮您。", tool_calls=[])
+        state = {
+            "current_intent": None,
+            "cert_parse_error": None,
+            "task_entry": make_task(),
+            "messages": [ai],
+        }
+        out = think_act_check_node(state)
+        result = out["check_results"][0]
+        self.assertFalse(result.passed)
+        v = result.violations[0]
+        self.assertEqual(v.rule_id, "R-CERT-REQUIRED")
+        chain = " ".join(v.evidence_chain)
+        self.assertIn("No tool_calls present", chain)
+        self.assertEqual(v.actual_value, "no tool_calls")
+
+
     def test_param_out_of_constraints(self):
         cert = make_cert(
             op="lookup_order",
