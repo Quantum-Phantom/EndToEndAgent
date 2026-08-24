@@ -552,6 +552,12 @@ def think_node(state: ReCAPState) -> dict:
         "    - email  -> a SINGLE bare email string (e.g. \"alice@example.com\");\n"
         "    - enum   -> a non-empty array of allowed values (e.g. [\"O001\", \"O002\"]);\n"
         "    - bool   -> true or false.\n"
+        "  Operator must match the shape of `value`:\n"
+        "    - ARRAY value (enum): use \"in\" to allow-list the values, or \"not_in\" to "
+        "forbid them, e.g. {\"operator\": \"in\", \"value\": [\"O001\"], \"value_type\": \"enum\"};\n"
+        "    - scalar value (number/email/bool): use \"eq\"/\"ne\", numbers may also use "
+        "\"ge\"/\"le\"/\"gt\"/\"lt\";\n"
+        "    - never pair an ARRAY value with \"eq\": write {\"operator\": \"in\", ...} instead.\n"
         "  Arbitrary/free-text strings are forbidden as parameter values. For an EMAIL field, "
         "use value_type \"email\" with a single bare email string (e.g. \"alice@example.com\"). "
         "For other string identifiers (order_id, sku, phone, ...), use value_type \"enum\" with an "
@@ -567,9 +573,9 @@ def think_node(state: ReCAPState) -> dict:
         '  "subgoal": "verify the customer\'s identity",\n'
         '  "proposed_operation": "verify_identity",\n'
         '  "argument_constraints": {\n'
-        '    "phone":    {"operator": "eq", "value": ["555-0101"],         "value_type": "enum"},\n'
+        '    "phone":    {"operator": "in", "value": ["555-0101"],         "value_type": "enum"},\n'
         '    "email":    {"operator": "eq", "value": "alice@example.com",  "value_type": "email"},\n'
-        '    "order_id": {"operator": "eq", "value": ["O001"],             "value_type": "enum"}\n'
+        '    "order_id": {"operator": "in", "value": ["O001"],             "value_type": "enum"}\n'
         "  },\n"
         '  "authority_basis": "user_request",\n'
         '  "expected_effect": "identity verification passes and a session_token is returned",\n'

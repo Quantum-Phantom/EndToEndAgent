@@ -143,6 +143,9 @@ class ConstraintOperator(str, Enum):
       - email:  eq/ne/in/not_in/regex
       - enum:   eq/ne/in/not_in/regex/expr
       - bool:   eq/ne
+
+    求值语义：数组值搭配 eq/ne 按成员包含/排除求值（等价 in/not_in），
+    标量值搭配 eq/ne 为严格相等/不等。枚举约束推荐直接使用 in/not_in。
     """
 
     EQ = "eq"
@@ -381,9 +384,16 @@ def _eval_constraint(
     if op == ConstraintOperator.EXPR:
         return bool(_eval_expr(str(expected), actual))
 
+    # 宽容语义：enum 约束的 value 必须是数组，而实际参数通常是标量字符串，
+    # 若按严格相等比较则 ["X"] 与 "X" 恒不相等（R-PARAM-RANGE 误报根源）。
+    # 因此数组值搭配 eq/ne 按成员包含/排除求值，等价于 in/not_in。
     if op == ConstraintOperator.EQ:
+        if isinstance(expected, (list, tuple, set)):
+            return actual in expected
         return actual == expected
     if op == ConstraintOperator.NE:
+        if isinstance(expected, (list, tuple, set)):
+            return actual not in expected
         return actual != expected
 
     # 数值比较：实际值必须为数值，否则视为不满足

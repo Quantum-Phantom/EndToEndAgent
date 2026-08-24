@@ -334,6 +334,60 @@ class TestThinkActCheck(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Constraint(operator=ConstraintOperator.GE, value="x", value_type=ConstraintValueType.EMAIL)
 
+    def test_enum_eq_with_list_value_is_membership(self):
+        # 回归测试（output.log）：enum 约束 value 必须为数组，若 eq 按严格相等
+        # 比较，["O001"] 与实际参数 "O001" 恒不相等 -> R-PARAM-RANGE 误报。
+        # 数组值搭配 eq/ne 应按成员包含/排除求值。
+        c_eq = Constraint(operator=ConstraintOperator.EQ, value=["O001"], value_type=ConstraintValueType.ENUM)
+        self.assertTrue(c_eq.check("O001"))
+        self.assertFalse(c_eq.check("O002"))
+        c_ne = Constraint(operator=ConstraintOperator.NE, value=["O002"], value_type=ConstraintValueType.ENUM)
+        self.assertTrue(c_ne.check("O001"))
+        self.assertFalse(c_ne.check("O002"))
+
+    def test_live_log_certificate_with_eq_array_passes(self):
+        # 回归测试（output.log）：LLM 完全按系统提示词示例输出 eq + 数组枚举约束，
+        # think->act 检查不得再误报 R-PARAM-RANGE。
+        cert = make_cert(
+            op="verify_identity",
+            authority="user_request",
+            constraints={
+                ConstraintField.PHONE: Constraint(
+                    operator=ConstraintOperator.EQ,
+                    value=["555-0101"],
+                    value_type=ConstraintValueType.ENUM,
+                ),
+                ConstraintField.EMAIL: Constraint(
+                    operator=ConstraintOperator.EQ,
+                    value="alice@example.com",
+                    value_type=ConstraintValueType.EMAIL,
+                ),
+                ConstraintField.ORDER_ID: Constraint(
+                    operator=ConstraintOperator.EQ,
+                    value=["O001"],
+                    value_type=ConstraintValueType.ENUM,
+                ),
+            },
+        )
+        ai = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "verify_identity",
+                    "args": {"phone": "555-0101", "email": "alice@example.com", "order_id": "O001"},
+                    "id": "tc-1",
+                }
+            ],
+        )
+        state = {
+            "current_intent": cert,
+            "task_entry": make_task(),
+            "messages": [ai],
+            "ledger_entries": [],
+        }
+        out = think_act_check_node(state)
+        self.assertTrue(out["check_results"][0].passed)
+
 
 class TestMultiRoundFreshIntent(unittest.TestCase):
     """回归测试：多轮 ReAct 中 think_node 必须每轮解析新证书，不得复用上一轮
