@@ -247,6 +247,9 @@ _GATE_RETRY_LIMIT = 3
 # 无 tool_calls 但存在未闭合义务时的强制续跑上限（防虚假宣布完成的死循环）。
 _FORCED_CONTINUE_LIMIT = 3
 
+# 连续 replan 上限：超过后升级人工，防止非 R-OBLIGATION-GATE 类违规导致的无限循环。
+_CONSECUTIVE_REPLAN_LIMIT = 6
+
 # ObligationEntry.description 的固定格式（见 observe_node）：解析证据名与产出工具。
 _OBLIGATION_DESC_RE = re.compile(r"evidence '(.+?)' from (.+)")
 
@@ -264,20 +267,6 @@ def _pending_obligation_evidence() -> list[tuple[Any, EvidenceType, str]]:
             continue
         resolved.append((obl, evidence, m.group(2)))
     return resolved
-
-
-def _gate_violation_count(obligation_id: str) -> int:
-    """统计指定义务被 R-OBLIGATION-GATE 拦截的历史次数。"""
-    count = 0
-    for entry in get_ledger_store().entries:
-        if not isinstance(entry, ViolationEntry):
-            continue
-        v = entry.violation
-        if v.rule_id != "R-OBLIGATION-GATE":
-            continue
-        if any(obligation_id in line for line in v.evidence_chain):
-            count += 1
-    return count
 
 
 def _current_run_violation_count(rule_id: str) -> int:
@@ -342,13 +331,15 @@ def _check_open_obligations(cert: IntentCertificate) -> list[ViolationEvidence]:
     """
     violations: list[ViolationEvidence] = []
     declared = {e.value for e in cert.required_evidence}
+    # 使用本轮运行内的全局 R-OBLIGATION-GATE 违规次数（而非 per-obligation_id），
+    # 因为每次 replan 会生成新 certificate_id / obligation_id，per-ID 计数永远为 0。
+    global_retries = _current_run_violation_count("R-OBLIGATION-GATE")
     for obl, evidence, producing_tool in _pending_obligation_evidence():
         if producing_tool == cert.proposed_operation and evidence.value in declared:
             continue
-        retries = _gate_violation_count(obl.obligation_id)
         decision = (
             RecoveryAction.HUMAN_ESCALATION
-            if retries >= _GATE_RETRY_LIMIT
+            if global_retries >= _GATE_RETRY_LIMIT
             else RecoveryAction.REPLAN
         )
         if producing_tool != cert.proposed_operation:
@@ -377,7 +368,7 @@ def _check_open_obligations(cert: IntentCertificate) -> list[ViolationEvidence]:
                 evidence_chain=[
                     f"Obligation: {obl.obligation_id} ({obl.description}) "
                     f"status={obl.status.value}",
-                    f"retry count = {retries}/{_GATE_RETRY_LIMIT}",
+                    f"retry count = {global_retries}/{_GATE_RETRY_LIMIT}",
                 ],
             )
         )
@@ -464,6 +455,7 @@ class ReCAPState(MessagesState):
     current_action: NotRequired[ActionEvent | None]
     current_observation: NotRequired[ObservationEvent | None]
     cert_parse_error: NotRequired[str | None]
+    consecutive_replan: NotRequired[int]
     ledger_entries: NotRequired[Annotated[list[LedgerEntry], add]]
     check_results: NotRequired[Annotated[list[TransitionResult], add]]
 
@@ -648,6 +640,7 @@ def think_node(state: ReCAPState) -> dict:
         "round_num": round_num,
         "current_intent": cert,
         "cert_parse_error": cert_parse_error,
+        "consecutive_replan": 0,
         "messages": [ai_message] if ai_message is not None else [],
         "ledger_entries": _record(*ledger)["ledger_entries"],
     }
@@ -1222,7 +1215,15 @@ def replan_node(state: ReCAPState) -> dict:
     latest = results[-1]
     actions = latest.recovery_actions or []
 
-    updated = {}
+    # 连续 replan 计数：每次进入 replan_node 执行恢复时递增，
+    # think_node 在成功开启新一轮时重置为 0。
+    replan_count = state.get("consecutive_replan", 0) + 1
+
+    # 连续 replan 超限：强制升级人工，防止非 gate 类违规导致的无限循环。
+    if replan_count >= _CONSECUTIVE_REPLAN_LIMIT:
+        actions = [RecoveryAction.HUMAN_ESCALATION]
+
+    updated: dict[str, Any] = {"consecutive_replan": replan_count}
     new_messages: list = []
     cert = state.get("current_intent")
     cert_id = cert.certificate_id if cert else ""
@@ -1276,6 +1277,19 @@ def replan_node(state: ReCAPState) -> dict:
             )
         )["ledger_entries"]
     return updated
+
+
+def route_after_replan(
+    state: ReCAPState,
+) -> Literal["think_node", "__end__"]:
+    """Replan 后路由。
+
+    - 连续 replan 超限 -> END（终止，等待人工介入）
+    - 否则 -> think_node（进入下一轮）
+    """
+    if state.get("consecutive_replan", 0) >= _CONSECUTIVE_REPLAN_LIMIT:
+        return "__end__"
+    return "think_node"
 
 
 def route_after_think_act_check(
@@ -1490,7 +1504,14 @@ def build_recap_graph() -> StateGraph:
 
     # ── 恢复流水线：repair -> replan -> think（下一轮） ──
     graph.add_edge("repair_node", "replan_node")
-    graph.add_edge("replan_node", "think_node")
+    graph.add_conditional_edges(
+        "replan_node",
+        route_after_replan,
+        {
+            "think_node": "think_node",
+            "__end__": END,
+        },
+    )
 
     return graph
 
