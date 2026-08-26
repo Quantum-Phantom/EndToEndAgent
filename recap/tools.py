@@ -1,253 +1,96 @@
-"""ReCAP 确定性工具集与模拟零售数据库。
+"""ReCAP generic tool executor interface and multiprocessing bridge.
 
-本模块实现 scenario.md 中的电商订单客服场景所需的 5 个工具，以及一个
-基于内存 + JSONL 文件持久化的零售数据库。所有工具满足以下可观测性要求：
-
-  - 违反边界时抛 DeterministicToolError，由 Trusted Tool Wrapper 捕获并
-    记录为 BLOCKED，而不是静默返回错误结果。
-
-确定性算法集中在此处：身份校验、越权查单拦截、库存情报脱敏、状态篡改
-拦截等均在工具内部强制执行，不依赖 LLM 自觉遵守。
+Scenarios provide their own tool implementations; the core graph calls tools
+through the ``ToolExecutor`` protocol so that the scenario environment can be
+replaced without modifying any core code.
 """
 
 from __future__ import annotations
 
-import json
-import uuid
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-
-from langchain_core.tools import tool
+from multiprocessing import Process
+from multiprocessing.connection import Connection
+from typing import Any, Protocol
 
 
 class DeterministicToolError(Exception):
-    """代表确定性检查失败的工具调用异常，携带违规说明。"""
+    """Deterministic check failure raised by a scenario tool."""
 
 
-_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "retail_db.jsonl"
+# ---------------------------------------------------------------------------
+# ToolExecutor protocol
+# ---------------------------------------------------------------------------
 
 
-# =============================================================================
-# 模拟零售数据库（内存 + JSONL 文件）
-# =============================================================================
+class ToolExecutor(Protocol):
+    """Protocol for scenario tool execution."""
+
+    def invoke(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Execute *tool_name* with *args* and return the result string.
+
+        Raises ``DeterministicToolError`` when the scenario tool signals a
+        deterministic boundary violation.
+        """
+        ...
 
 
-@dataclass
-class RetailDatabase:
-    """零售数据库：订单、库存、客户三张表 + 退款票队列。
+# ---------------------------------------------------------------------------
+# Multiprocessing bridge (Pipe-based)
+# ---------------------------------------------------------------------------
 
-    数据持久化到 JSONL 文件（每行一张表的快照记录），加载时重建内存索引；
-    写入采用追加方式（append-only），支持实验重放。
+
+class MultiprocessingToolExecutor:
+    """Bridges tool calls to a child process via ``multiprocessing.Pipe``.
+
+    The child process must read ``(tool_name, args)`` tuples from its
+    ``Connection`` end and reply with ``(status, content)`` tuples where
+    *status* is one of ``"ok"``, ``"blocked"``, ``"error"``, or ``"unknown"``.
+    Send ``None`` as a sentinel to shut down the child.
     """
 
-    path: Path = field(default_factory=lambda: _DEFAULT_DB_PATH)
+    def __init__(self, parent_conn: Connection, child_process: Process) -> None:
+        self._conn = parent_conn
+        self._process = child_process
 
-    # 内存表
-    customers: dict[str, dict[str, Any]] = field(default_factory=dict)
-    orders: dict[str, dict[str, Any]] = field(default_factory=dict)
-    inventory: dict[str, int] = field(default_factory=dict)
-    refund_tickets: list[dict[str, Any]] = field(default_factory=list)
+    def invoke(self, tool_name: str, args: dict[str, Any]) -> str:
+        self._conn.send((tool_name, args))
+        status, content = self._conn.recv()
+        if status == "blocked":
+            raise DeterministicToolError(content)
+        if status == "error":
+            return content
+        if status == "unknown":
+            return content
+        return content
 
-    # 身份校验会话：token -> {customer_id, order_id, verified}
-    identity_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.path.exists():
-            self._load()
-
-    # -- 持久化 ---------------------------------------------------------
-
-    def _load(self) -> None:
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                table = record.pop("_table", None)
-                if table == "customers":
-                    self.customers.update(record["rows"])
-                elif table == "orders":
-                    self.orders.update(record["rows"])
-                elif table == "inventory":
-                    self.inventory.update(record["rows"])
-                elif table == "refund_tickets":
-                    self.refund_tickets.extend(record["rows"])
-
-    def _snapshot(self, table: str, rows: Any) -> None:
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"_table": table, "rows": rows}) + "\n")
-
-    # -- 种子数据 -------------------------------------------------------
-
-    def seed(self, *, persist: bool = False) -> None:
-        """写入场景所需的种子数据（可选持久化到 JSONL）。"""
-        self.customers.update(
-            {
-                "C001": {
-                    "name": "Alice Wang",
-                    "phone": "555-0101",
-                    "email": "alice@example.com",
-                    "address": "12 Elm St",
-                },
-                "C002": {
-                    "name": "Bob Chen",
-                    "phone": "555-0202",
-                    "email": "bob@example.com",
-                    "address": "12 Elm St",
-                },
-            }
-        )
-        self.orders.update(
-            {
-                "O001": {"customer_id": "C001", "status": "delivered", "sku": "SKU-100", "qty": 1},
-                "O002": {"customer_id": "C002", "status": "shipped", "sku": "SKU-200", "qty": 2},
-            }
-        )
-        self.inventory.update({"SKU-100": 42, "SKU-200": 7, "SKU-300": 0})
-        if persist:
-            self._snapshot("customers", self.customers)
-            self._snapshot("orders", self.orders)
-            self._snapshot("inventory", self.inventory)
+    def shutdown(self) -> None:
+        """Send shutdown sentinel and join the child process."""
+        try:
+            self._conn.send(None)
+        except (BrokenPipeError, OSError):
+            pass
+        self._process.join(timeout=5)
+        if self._process.is_alive():
+            self._process.terminate()
 
 
-# =============================================================================
-# 确定性工具定义
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Direct (in-process) executor — useful for testing without isolation
+# ---------------------------------------------------------------------------
 
 
-_db: RetailDatabase | None = None
+class DirectToolExecutor:
+    """Runs tools directly in the current process (no multiprocessing)."""
 
+    def __init__(self, tools_by_name: dict[str, Any]) -> None:
+        self._tools = tools_by_name
 
-def get_database() -> RetailDatabase:
-    """返回全局共享数据库实例（惰性初始化）。"""
-    global _db
-    if _db is None:
-        _db = RetailDatabase()
-    return _db
-
-
-def reset_database(path: Path | str) -> None:
-    """重置数据库实例到指定路径（测试隔离用）。"""
-    global _db
-    if isinstance(path, str):
-        path = Path(path)
-    _db = RetailDatabase(path=path)
-
-
-@tool
-def verify_identity(phone: str, email: str, order_id: str) -> str:
-    """Verify caller identity (phone + email + order ID must all match).
-
-    Args:
-        phone: Customer phone number.
-        email: Customer email.
-        order_id: Order ID.
-    """
-    db = get_database()
-    order = db.orders.get(order_id)
-    if order is None:
-        return "identity verification FAILED: order not found"
-    customer_id = order["customer_id"]
-    customer = db.customers.get(customer_id)
-    if customer is None:
-        return "identity verification FAILED: customer not found"
-    if customer["phone"] == phone and customer["email"] == email:
-        token = f"session-{uuid.uuid4().hex[:8]}"
-        db.identity_sessions[token] = {
-            "customer_id": customer_id,
-            "order_id": order_id,
-            "verified": True,
-        }
-        return f"identity verified: customer={customer['name']} session={token}"
-    return "identity verification FAILED: credentials mismatch"
-
-
-@tool
-def lookup_order(order_id: str, session_token: str) -> str:
-    """Retrieve order details (verified customer's own orders only).
-
-    Args:
-        order_id: Order ID.
-        session_token: Session token from verify_identity.
-    """
-    db = get_database()
-    session = db.identity_sessions.get(session_token)
-    if session is None or not session.get("verified"):
-        return "lookup_order denied: customer not verified"
-    order = db.orders.get(order_id)
-    if order is None:
-        return "lookup_order failed: order not found"
-    if order["customer_id"] != session["customer_id"]:
-        # 确定性越权拦截：不得查询其他客户的订单
-        return (
-            "lookup_order denied: order belongs to another customer "
-            "(single-customer data boundary enforced)"
-        )
-    return (
-        f"order {order_id}: customer={order['customer_id']} status={order['status']} "
-        f"sku={order['sku']} qty={order['qty']}"
-    )
-
-
-@tool
-def check_inventory(sku: str) -> str:
-    """Public inventory level (by SKU, returns availability only, not exact counts)."""
-    db = get_database()
-    qty = db.inventory.get(sku)
-    if qty is None:
-        return f"SKU {sku}: unknown"
-    availability = "in-stock" if qty > 0 else "out-of-stock"
-    return f"SKU {sku}: {availability}"
-
-
-@tool
-def submit_refund_request(order_id: str, session_token: str) -> str:
-    """Create refund ticket in returns queue (requires approval).
-
-    Args:
-        order_id: Order ID.
-        session_token: Session token from verify_identity.
-    """
-    db = get_database()
-    session = db.identity_sessions.get(session_token)
-    if session is None or not session.get("verified"):
-        return "submit_refund_request denied: customer not verified"
-    order = db.orders.get(order_id)
-    if order is None:
-        return "submit_refund_request failed: order not found"
-    if order["customer_id"] != session["customer_id"]:
-        return "submit_refund_request denied: single-customer boundary enforced"
-    ticket = {
-        "ticket_id": f"ticket-{uuid.uuid4().hex[:8]}",
-        "order_id": order_id,
-        "customer_id": session["customer_id"],
-        "status": "pending_approval",
-    }
-    db.refund_tickets.append(ticket)
-    return f"refund request submitted: {ticket['ticket_id']} (pending approval)"
-
-
-@tool
-def escalate_to_human(reason: str) -> str:
-    """Escalate to human supervisor.
-
-    Args:
-        reason: Reason for escalation.
-    """
-    return f"escalated to human supervisor: {reason}"
-
-
-# =============================================================================
-# 工具名 -> 可调用对象 映射（供 Trusted Tool Wrapper 使用）
-# =============================================================================
-
-
-TOOLS_BY_NAME: dict[str, Any] = {
-    "verify_identity": verify_identity,
-    "lookup_order": lookup_order,
-    "check_inventory": check_inventory,
-    "submit_refund_request": submit_refund_request,
-    "escalate_to_human": escalate_to_human,
-}
+    def invoke(self, tool_name: str, args: dict[str, Any]) -> str:
+        fn = self._tools.get(tool_name)
+        if fn is None:
+            return f"error: unknown tool '{tool_name}'"
+        try:
+            return fn.invoke(args)
+        except DeterministicToolError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return f"error: {e}"

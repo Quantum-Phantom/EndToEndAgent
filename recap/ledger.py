@@ -4,7 +4,7 @@
 数据模式见 recap.schemas。账本只增不改，证据义务按 obligation_id 去重取
 最新状态。
 
-与 recap.tools.RetailDatabase 保持相同的 JSONL 追加风格：
+与 scenarios 中的数据库保持相同的 JSONL 追加风格：
 每行一个 JSON 对象，携带已序列化的账本条目。
 """
 
@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from recap.schemas import (
-    EvidenceType,
     LedgerEntry,
     ObligationEntry,
     ObligationStatus,
@@ -43,52 +42,42 @@ class EvidenceDetector:
         return m.group(1) if m.groups() else m.group(0)
 
 
-EVIDENCE_DETECTORS: dict[EvidenceType, EvidenceDetector] = {
-    EvidenceType.SESSION_TOKEN: EvidenceDetector("verify_identity", r"session=(\S+)"),
-    EvidenceType.ORDER_RETRIEVAL: EvidenceDetector("lookup_order", r"status=(\S+)"),
-    EvidenceType.PUBLIC_STOCK: EvidenceDetector("check_inventory", r"\b(in-stock|out-of-stock)\b"),
-    EvidenceType.REFUND_TICKET: EvidenceDetector("submit_refund_request", r"ticket-(\S+)"),
-    EvidenceType.ESCALATION_CONFIRMATION: EvidenceDetector("escalate_to_human", r"escalated to human supervisor"),
-}
-
-
-def register_evidence(name: EvidenceType, source_tool: str, pattern: str) -> None:
-    """注册证据检测器（允许扩展场景字段）。"""
-    EVIDENCE_DETECTORS[name] = EvidenceDetector(source_tool, pattern)
-
-
-def evidence_sources() -> dict[str, list[EvidenceType]]:
-    """返回 tool_name -> 可产出证据类型列表 的映射（由 EVIDENCE_DETECTORS 推导）。
+def evidence_sources(detectors: dict[str, EvidenceDetector]) -> dict[str, list[str]]:
+    """返回 tool_name -> 可产出证据类型列表 的映射。
 
     供 think_node 注入提示词与 think_act_check_node 做证据可行性检查：
     required_evidence 中声明的证据必须能由 proposed_operation 产出。
     """
-    sources: dict[str, list[EvidenceType]] = {}
-    for evidence, detector in EVIDENCE_DETECTORS.items():
-        sources.setdefault(detector.source_tool, []).append(evidence)
+    sources: dict[str, list[str]] = {}
+    for evidence_name, detector in detectors.items():
+        sources.setdefault(detector.source_tool, []).append(evidence_name)
     return sources
 
 
-def source_tool_for(evidence: EvidenceType) -> str:
+def source_tool_for(evidence_name: str, detectors: dict[str, EvidenceDetector]) -> str:
     """返回能产出指定证据类型的来源工具名（未注册时返回空字符串）。"""
-    detector = EVIDENCE_DETECTORS.get(evidence)
+    detector = detectors.get(evidence_name)
     return detector.source_tool if detector is not None else ""
 
 
-def collect_evidence(action: Any, observation: Any) -> dict[EvidenceType, str]:
+def collect_evidence(
+    action: Any,
+    observation: Any,
+    detectors: dict[str, EvidenceDetector],
+) -> dict[str, str]:
     """检测给定动作对应的观测中收集到的证据。
 
     仅当 action 的工具名与检测器声明的 source_tool 一致时才尝试匹配。
-    返回键为 EvidenceType、值为提取的字符串/整体匹配文本的字典。
+    返回键为证据名、值为提取的字符串/整体匹配文本的字典。
     """
-    collected: dict[EvidenceType, str] = {}
+    collected: dict[str, str] = {}
     tool_name = getattr(action, "tool_name", "")
-    for evidence, detector in EVIDENCE_DETECTORS.items():
+    for evidence_name, detector in detectors.items():
         if detector.source_tool != tool_name:
             continue
         value = detector.extract(observation)
         if value is not None:
-            collected[evidence] = value
+            collected[evidence_name] = value
     return collected
 
 

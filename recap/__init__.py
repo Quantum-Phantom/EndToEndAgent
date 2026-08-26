@@ -8,8 +8,11 @@ from recap.schemas import (
     ViolationType,
     RecoveryAction,
     ObligationStatus,
-    EvidenceType,
+    AuthorityBasis,
+    ConstraintValueType,
+    ConstraintOperator,
     # Core data models
+    Constraint,
     IntentCertificate,
     ActionEvent,
     ObservationEvent,
@@ -29,7 +32,9 @@ from recap.schemas import (
 
 from recap.graph import (
     ReCAPState,
+    ScenarioConfig,
     set_llm,
+    set_scenario,
     init_node,
     think_node,
     act_node,
@@ -44,32 +49,44 @@ from recap.graph import (
     route_after_act_observe_check,
     route_after_observe_think_check,
     build_recap_graph,
-    recap_graph_builder,
 )
 
 from recap.ledger import (
     EvidenceDetector,
-    EVIDENCE_DETECTORS,
-    register_evidence,
     collect_evidence,
+    evidence_sources,
+    source_tool_for,
     LedgerStore,
     get_ledger_store,
     reset_ledger_store,
 )
 
+from recap.tools import (
+    ToolExecutor,
+    MultiprocessingToolExecutor,
+    DirectToolExecutor,
+    DeterministicToolError,
+)
+
 __all__ = [
+    # Enums
     "TrustLevel",
     "DataSource",
     "ExecutionStatus",
     "ViolationType",
     "RecoveryAction",
     "ObligationStatus",
-    "EvidenceType",
+    "AuthorityBasis",
+    "ConstraintValueType",
+    "ConstraintOperator",
+    # Core data models
+    "Constraint",
     "IntentCertificate",
     "ActionEvent",
     "ObservationEvent",
     "ViolationEvidence",
     "TransitionResult",
+    # Ledger entries
     "TaskEntry",
     "IntentEntry",
     "ActionEntry",
@@ -79,8 +96,11 @@ __all__ = [
     "RepairEntry",
     "ReplanEntry",
     "LedgerEntry",
+    # Graph
     "ReCAPState",
+    "ScenarioConfig",
     "set_llm",
+    "set_scenario",
     "init_node",
     "think_node",
     "act_node",
@@ -95,12 +115,17 @@ __all__ = [
     "route_after_act_observe_check",
     "route_after_observe_think_check",
     "build_recap_graph",
-    "recap_graph_builder",
+    # Ledger
     "EvidenceDetector",
-    "EVIDENCE_DETECTORS",
-    "register_evidence",
     "collect_evidence",
+    "evidence_sources",
+    "source_tool_for",
     "LedgerStore",
     "get_ledger_store",
     "reset_ledger_store",
+    # Tool executor
+    "ToolExecutor",
+    "MultiprocessingToolExecutor",
+    "DirectToolExecutor",
+    "DeterministicToolError",
 ]

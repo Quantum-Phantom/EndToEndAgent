@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 # =============================================================================
@@ -107,21 +107,6 @@ class AuthorityBasis(str, Enum):
     VERIFIED_SESSION = "verified_session"
 
 
-class EvidenceType(str, Enum):
-    """证据类型——Think 阶段在 `required_evidence` 中声明的受控词表。
-
-    每项证据必须对应一个确定性检测器（见 recap.ledger.EVIDENCE_DETECTORS），
-    由来源工具 + 正则共同决定是否收集到。声明不在注册表中的证据将在
-    证书校验阶段被拒绝。
-    """
-
-    SESSION_TOKEN = "session_token"
-    ORDER_RETRIEVAL = "order_retrieval"
-    PUBLIC_STOCK = "public_stock"
-    REFUND_TICKET = "refund_ticket"
-    ESCALATION_CONFIRMATION = "escalation_confirmation"
-
-
 class ConstraintValueType(str, Enum):
     """约束值类型——argument_constraints 中每条约束的值的受控类型。
 
@@ -158,24 +143,6 @@ class ConstraintOperator(str, Enum):
     NOT_IN = "not_in"
     REGEX = "regex"
     EXPR = "expr"
-
-
-class ConstraintField(str, Enum):
-    """参数约束键——全局固定有限集合。
-
-    证书中 argument_constraints 的键必须来自此集合；新增工具参数名时须
-    在此登记，从而保证键可静态枚举、可校验，而非任意自由字符串。
-    """
-
-    ORDER_ID = "order_id"
-    SESSION_TOKEN = "session_token"
-    SKU = "sku"
-    PHONE = "phone"
-    EMAIL = "email"
-    REASON = "reason"
-    QTY = "qty"
-    CUSTOMER_ID = "customer_id"
-    STATUS = "status"
 
 
 # =============================================================================
@@ -218,10 +185,10 @@ _CONSTRAINT_OPERATOR_BY_TYPE: dict[ConstraintValueType, frozenset[ConstraintOper
 
 
 class Constraint(BaseModel):
-    """一条参数约束：{key, operator, value}，其中 key 来自 ConstraintField。
+    """一条参数约束：{key, operator, value}，其中 key 为参数名字符串。
 
     键值对标准：
-      - key    ∈ ConstraintField（固定有限集合）
+      - key    为参数名字符串（由场景的 constraint_fields 定义）
       - value  属于 value_type 指定的受控类型（number/email/enum/bool）
       - operator ∈ 有限集合，且须与 value_type 合法组合（见
         _CONSTRAINT_OPERATOR_BY_TYPE，由 model_validator 强制）
@@ -430,9 +397,9 @@ class IntentCertificate(BaseModel):
     round_num: int = Field(default=0, ge=0, description="当前 ReAct 轮次")
     subgoal: str = Field(..., min_length=1, description="本轮具体子目标")
     proposed_operation: str = Field(..., min_length=1, description="拟执行的工具/动作名称")
-    argument_constraints: dict[ConstraintField, Constraint] = Field(
+    argument_constraints: dict[str, Constraint] = Field(
         default_factory=dict,
-        description="参数约束（键值对标准）：键来自 ConstraintField，值为 Constraint 对象。"
+        description="参数约束（键值对标准）：键为参数名字符串，值为 Constraint 对象。"
         "例如 {\"order_id\": {\"operator\": \"in\", \"value\": [\"O001\"], \"value_type\": \"enum\"}}",
     )
     authority_basis: AuthorityBasis = Field(
@@ -441,18 +408,10 @@ class IntentCertificate(BaseModel):
         + " / ".join(a.value for a in AuthorityBasis),
     )
     expected_effect: str = Field(..., min_length=1, description="预期效果：允许和禁止的状态变化")
-    required_evidence: list[EvidenceType] = Field(
+    required_evidence: list[str] = Field(
         default_factory=list,
-        description="执行后必须获得的回执或来源证明（受控词表 EvidenceType）",
+        description="执行后必须获得的回执或来源证明（由场景定义的 EvidenceType 词表）",
     )
-
-    @field_validator("required_evidence", mode="after")
-    @classmethod
-    def _ensure_known_evidence(
-        cls, v: list[EvidenceType],
-    ) -> list[EvidenceType]:
-        """确保证据列表去重且所有证据类型均已注册。"""
-        return list(dict.fromkeys(v))
 
 
 # =============================================================================

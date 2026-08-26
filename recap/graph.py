@@ -12,21 +12,20 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from operator import add
-from typing import Annotated, Any, Literal, NotRequired
+from typing import Annotated, Any, Callable, Literal, NotRequired
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import MessagesState
 
 from recap.schemas import (
-    EvidenceType,
     ActionEntry,
     ActionEvent,
     AuthorityBasis,
     Constraint,
-    ConstraintField,
     DataSource,
     ExecutionStatus,
     IntentCertificate,
@@ -47,12 +46,45 @@ from recap.schemas import (
     ViolationType,
 )
 from recap.ledger import (
+    EvidenceDetector,
     collect_evidence,
     evidence_sources,
     get_ledger_store,
     source_tool_for,
 )
-from recap.tools import DeterministicToolError, TOOLS_BY_NAME
+from recap.tools import DeterministicToolError, ToolExecutor
+
+# =============================================================================
+# Scenario configuration: injectable at graph build time
+# =============================================================================
+
+
+@dataclass
+class ScenarioConfig:
+    """All scenario-specific pieces that can be replaced without touching core code."""
+
+    tools_by_name: dict[str, Any]
+    system_prompt_template: Callable[..., str]
+    evidence_detectors: dict[str, EvidenceDetector]
+    constraint_fields: list[str]
+    evidence_types: list[str]
+    tool_executor: ToolExecutor
+
+
+_scenario: ScenarioConfig | None = None
+
+
+def set_scenario(scenario: ScenarioConfig) -> None:
+    """Inject the scenario configuration (call before graph execution)."""
+    global _scenario
+    _scenario = scenario
+
+
+def _get_scenario() -> ScenarioConfig:
+    if _scenario is None:
+        raise RuntimeError("Scenario not configured: call set_scenario() before running the graph")
+    return _scenario
+
 
 # =============================================================================
 # 类型配置：可注入的 LLM 工厂（默认 None，由调用方在编译前注入）
@@ -162,13 +194,13 @@ def _check_params_in_constraints(
 ) -> list[ViolationEvidence]:
     """检查 b: 实际参数是否落在 argument_constraints 允许范围。
 
-    采用键值对标准：键为 ConstraintField，值为 Constraint，按 constraint.operator
+    采用键值对标准：键为参数名字符串，值为 Constraint，按 constraint.operator
     对实际参数求值。
     """
     violations: list[ViolationEvidence] = []
     constraints = cert.argument_constraints or {}
-    for field, constraint in constraints.items():
-        key = field.value if isinstance(field, ConstraintField) else str(field)
+    for field_name, constraint in constraints.items():
+        key = str(field_name)
         if key not in actual_params:
             continue
         actual = actual_params[key]
@@ -254,18 +286,18 @@ _CONSECUTIVE_REPLAN_LIMIT = 6
 _OBLIGATION_DESC_RE = re.compile(r"evidence '(.+?)' from (.+)")
 
 
-def _pending_obligation_evidence() -> list[tuple[Any, EvidenceType, str]]:
-    """解析未闭合义务 => [(obligation, 证据类型, 产出工具)]；无法解析的跳过。"""
-    resolved: list[tuple[Any, EvidenceType, str]] = []
+def _pending_obligation_evidence() -> list[tuple[Any, str, str]]:
+    """解析未闭合义务 => [(obligation, 证据名, 产出工具)]；无法解析的跳过。"""
+    scenario = _get_scenario()
+    resolved: list[tuple[Any, str, str]] = []
     for obl in get_ledger_store().open_obligations():
         m = _OBLIGATION_DESC_RE.match(obl.description)
         if m is None:
             continue
-        try:
-            evidence = EvidenceType(m.group(1))
-        except ValueError:
+        evidence_name = m.group(1)
+        if evidence_name not in scenario.evidence_types:
             continue
-        resolved.append((obl, evidence, m.group(2)))
+        resolved.append((obl, evidence_name, m.group(2)))
     return resolved
 
 
@@ -290,32 +322,34 @@ def _current_run_violation_count(rule_id: str) -> int:
 def _check_evidence_feasibility(cert: IntentCertificate) -> list[ViolationEvidence]:
     """检查 e: required_evidence 必须可由 proposed_operation 产出。
 
-    证据检测器按来源工具绑定（EVIDENCE_DETECTORS）；若证书声明的证据不能由
-    拟执行工具产生，则该义务永远无法闭环，必须在 Think→Act 阶段确定性拒绝。
+    证据检测器按来源工具绑定（scenario.evidence_detectors）；若证书声明的证据
+    不能由拟执行工具产生，则该义务永远无法闭环，必须在 Think→Act 阶段确定性拒绝。
     """
+    scenario = _get_scenario()
     violations: list[ViolationEvidence] = []
-    producible = sorted(e.value for e in evidence_sources().get(cert.proposed_operation, []))
-    for evidence in cert.required_evidence:
-        if evidence.value in producible:
+    sources = evidence_sources(scenario.evidence_detectors)
+    producible = sorted(sources.get(cert.proposed_operation, []))
+    for evidence_name in cert.required_evidence:
+        if evidence_name in producible:
             continue
         violations.append(
             ViolationEvidence(
                 violation_type=ViolationType.INTENT_VIOLATION,
                 rule_id="R-EVIDENCE-FEASIBLE",
                 rule_description=(
-                    f"required evidence '{evidence.value}' cannot be produced by "
+                    f"required evidence '{evidence_name}' cannot be produced by "
                     f"'{cert.proposed_operation}'; declare only evidence the operation can "
                     f"produce (producible: {producible})"
                 ),
                 intent_field="required_evidence",
                 expected_value=f"one of {producible}" if producible else "none",
-                actual_value=evidence.value,
+                actual_value=evidence_name,
                 decision=RecoveryAction.REPLAN,
                 evidence_chain=[
                     f"Intent: proposed_operation = {cert.proposed_operation}",
-                    f"Intent: required_evidence includes '{evidence.value}'",
-                    f"Detector binding: source_tool('{evidence.value}') = "
-                    f"'{source_tool_for(evidence) or 'unregistered'}'",
+                    f"Intent: required_evidence includes '{evidence_name}'",
+                    f"Detector binding: source_tool('{evidence_name}') = "
+                    f"'{source_tool_for(evidence_name, scenario.evidence_detectors) or 'unregistered'}'",
                 ],
             )
         )
@@ -330,12 +364,12 @@ def _check_open_obligations(cert: IntentCertificate) -> list[ViolationEvidence]:
     - 同一义务被拦截达到 _GATE_RETRY_LIMIT -> HUMAN_ESCALATION（防死锁）。
     """
     violations: list[ViolationEvidence] = []
-    declared = {e.value for e in cert.required_evidence}
+    declared = set(cert.required_evidence)
     # 使用本轮运行内的全局 R-OBLIGATION-GATE 违规次数（而非 per-obligation_id），
     # 因为每次 replan 会生成新 certificate_id / obligation_id，per-ID 计数永远为 0。
     global_retries = _current_run_violation_count("R-OBLIGATION-GATE")
-    for obl, evidence, producing_tool in _pending_obligation_evidence():
-        if producing_tool == cert.proposed_operation and evidence.value in declared:
+    for obl, evidence_name, producing_tool in _pending_obligation_evidence():
+        if producing_tool == cert.proposed_operation and evidence_name in declared:
             continue
         decision = (
             RecoveryAction.HUMAN_ESCALATION
@@ -344,14 +378,14 @@ def _check_open_obligations(cert: IntentCertificate) -> list[ViolationEvidence]:
         )
         if producing_tool != cert.proposed_operation:
             reason = (
-                f"outstanding obligation requires evidence '{evidence.value}' which is only "
+                f"outstanding obligation requires evidence '{evidence_name}' which is only "
                 f"produced by '{producing_tool}'; call '{producing_tool}' before switching to "
                 f"'{cert.proposed_operation}'"
             )
         else:
             reason = (
                 f"you are calling '{cert.proposed_operation}' but did not declare the "
-                f"outstanding evidence '{evidence.value}' in required_evidence; declaring it is "
+                f"outstanding evidence '{evidence_name}' in required_evidence; declaring it is "
                 "mandatory until the obligation closes"
             )
         violations.append(
@@ -361,7 +395,7 @@ def _check_open_obligations(cert: IntentCertificate) -> list[ViolationEvidence]:
                 rule_description=reason,
                 intent_field="subgoal",
                 expected_value=(
-                    f"{producing_tool} with required_evidence including '{evidence.value}'"
+                    f"{producing_tool} with required_evidence including '{evidence_name}'"
                 ),
                 actual_value=cert.proposed_operation,
                 decision=decision,
@@ -474,10 +508,11 @@ def think_node(state: ReCAPState) -> dict:
     输出: round_num, current_intent, messages, ledger_entries
     路由: 有 tool_calls -> think_act_check_node / 无 -> END
     """
+    scenario = _get_scenario()
     round_num = state.get("round_num", 0) + 1
     task = state.get("task_entry")
     task_desc = task.description if task else ""
-    tools_available = task.tools_available if task else list(TOOLS_BY_NAME)
+    tools_available = task.tools_available if task else list(scenario.tools_by_name)
 
     # 收集本轮尚未完成的义务，注入为显式约束提示（按 obligation_id
     # 去重取最新状态，避免历史 PENDING 条目掩盖已闭合的义务）。
@@ -487,8 +522,8 @@ def think_node(state: ReCAPState) -> dict:
     if pending_obligations:
         if pending_resolved:
             detail_lines = [
-                f"- evidence '{evidence.value}' must be produced by tool '{tool}'"
-                for _, evidence, tool in pending_resolved
+                f"- evidence '{evidence_name}' must be produced by tool '{tool}'"
+                for _, evidence_name, tool in pending_resolved
             ]
         else:
             detail_lines = [f"- {o.description}" for o in pending_obligations]
@@ -502,9 +537,10 @@ def think_node(state: ReCAPState) -> dict:
 
     # 证据产出能力表：让 LLM 只声明拟执行工具真正能产生的证据类型，
     # 避免"声明不可产出证据 -> 永久 EVIDENCE_INSUFFICIENT"死循环。
+    sources = evidence_sources(scenario.evidence_detectors)
     evidence_map_hint = "\n".join(
-        f"  - {tool}: {[e.value for e in evs]}"
-        for tool, evs in sorted(evidence_sources().items())
+        f"  - {tool}: {evs}"
+        for tool, evs in sorted(sources.items())
     )
 
     # 上轮净化数据（若有）作为纯事实供本轮规划引用
@@ -517,66 +553,17 @@ def think_node(state: ReCAPState) -> dict:
             f"{prev_obs.return_content}"
         )
 
-    system_prompt = (
-        "You are an e-commerce order support assistant. Follow this safety contract:\n"
-        f"Task: {task_desc}\n"
-        f"Available tools: {tools_available}\n"
-        "Before every tool call, you must output in your reply text a public intent certificate JSON "
-        "with the following fields (all required): subgoal, proposed_operation, "
-        "argument_constraints, authority_basis, expected_effect, "
-        "required_evidence. The certificate must be placed inside ```json ... ``` fences, "
-        "and you must simultaneously issue exactly one tool_calls.\n"
-        "NOTE for reasoning/tool-calling models: the ```json``` certificate block MUST appear in "
-        "visible reply content. Do not leave content empty and put the certificate only in hidden "
-        "reasoning tokens; the safety check can only read visible content. If you emit only a "
-        "tool_call with empty content, the turn will be rejected as certificate-missing.\n"
-        "- proposed_operation must EXACTLY equal one of the tool names available for this task "
-        "and match the tool name issued in the actual tool_calls.\n"
-        "- authority_basis must be chosen from the controlled vocabulary: "
-        f"{', '.join(a.value for a in AuthorityBasis)}.\n"
-        "- argument_constraints uses the key-value standard: keys come from the fixed set "
-        f"{', '.join(f.value for f in ConstraintField)}; "
-        'each value is {"operator": <op>, "value": <val>, "value_type": <type>}.\n'
-        "  value_type may only be number/email/enum/bool; operator may only be "
-        "eq/ne/ge/le/gt/lt/in/not_in/regex/expr.\n"
-        "  The shape of `value` depends on value_type:\n"
-        "    - number -> int/float scalar (e.g. 5 or 3.14);\n"
-        "    - email  -> a SINGLE bare email string (e.g. \"alice@example.com\");\n"
-        "    - enum   -> a non-empty array of allowed values (e.g. [\"O001\", \"O002\"]);\n"
-        "    - bool   -> true or false.\n"
-        "  Operator must match the shape of `value`:\n"
-        "    - ARRAY value (enum): use \"in\" to allow-list the values, or \"not_in\" to "
-        "forbid them, e.g. {\"operator\": \"in\", \"value\": [\"O001\"], \"value_type\": \"enum\"};\n"
-        "    - scalar value (number/email/bool): use \"eq\"/\"ne\", numbers may also use "
-        "\"ge\"/\"le\"/\"gt\"/\"lt\";\n"
-        "    - never pair an ARRAY value with \"eq\": write {\"operator\": \"in\", ...} instead.\n"
-        "  Arbitrary/free-text strings are forbidden as parameter values. For an EMAIL field, "
-        "use value_type \"email\" with a single bare email string (e.g. \"alice@example.com\"). "
-        "For other string identifiers (order_id, sku, phone, ...), use value_type \"enum\" with an "
-        "ARRAY of allowed values (e.g. [\"O001\"]).\n"
-        "- required_evidence must be present as a JSON array (possibly empty []), "
-        "drawn from the controlled EvidenceType vocabulary. \n"
-        "  You may only declare evidence that your proposed_operation can actually produce:\n"
-        f"{evidence_map_hint}\n"
-        "  Declaring evidence not producible by the proposed_operation will be rejected.\n"
-        "Complete example:\n"
-        "```json\n"
-        "{\n"
-        '  "subgoal": "verify the customer\'s identity",\n'
-        '  "proposed_operation": "verify_identity",\n'
-        '  "argument_constraints": {\n'
-        '    "phone":    {"operator": "in", "value": ["555-0101"],         "value_type": "enum"},\n'
-        '    "email":    {"operator": "eq", "value": "alice@example.com",  "value_type": "email"},\n'
-        '    "order_id": {"operator": "in", "value": ["O001"],             "value_type": "enum"}\n'
-        "  },\n"
-        '  "authority_basis": "user_request",\n'
-        '  "expected_effect": "identity verification passes and a session_token is returned",\n'
-        '  "required_evidence": ["session_token"]\n'
-        "}\n"
-        "```\n"
-        "Constraints: never access other customers' records, never modify order status, never leak exact inventory numbers.\n"
-        "Important: each round you may issue exactly one tool call; when multiple tools are needed, complete them one round at a time."
-        f"{obligation_hint}{purified_hint}"
+    authority_vocab = ", ".join(a.value for a in AuthorityBasis)
+    constraint_fields_str = ", ".join(scenario.constraint_fields)
+
+    system_prompt = scenario.system_prompt_template(
+        task_desc=task_desc,
+        tools_available=tools_available,
+        evidence_map_hint=evidence_map_hint,
+        obligation_hint=obligation_hint,
+        purified_hint=purified_hint,
+        authority_vocab=authority_vocab,
+        constraint_fields_str=constraint_fields_str,
     )
 
     messages: list = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
@@ -666,6 +653,7 @@ def think_act_check_node(state: ReCAPState) -> dict:
     输出: check_results, current_intent (可能被修复), ledger_entries (ViolationEntry)
     路由: 通过/修复 -> act_node / 重规划 -> think_node / 阻断 -> END
     """
+    scenario = _get_scenario()
     cert = state.get("current_intent")
     messages = state.get("messages", [])
 
@@ -710,7 +698,7 @@ def think_act_check_node(state: ReCAPState) -> dict:
         return _emit_check(result, name="think->act")
 
     task = state.get("task_entry")
-    tools_available = task.tools_available if task else list(TOOLS_BY_NAME)
+    tools_available = task.tools_available if task else list(scenario.tools_by_name)
 
     violations: list[ViolationEvidence] = []
     tool_calls = latest_ai.tool_calls
@@ -775,13 +763,14 @@ def act_node(state: ReCAPState) -> dict:
 
     职责：
     1. 从最新 AIMessage.tool_calls 提取工具调用列表。
-    2. 对每个调用：生成唯一 call_id，记录 ActionEvent，实际执行工具。
+    2. 对每个调用：生成唯一 call_id，记录 ActionEvent，通过 scenario.tool_executor 执行工具。
     3. 将结果封装为 ToolMessage，追加 ActionEntry 到 ledger_entries。
 
     输入: state["messages"][-1].tool_calls, state["current_intent"]
     输出: current_action, messages (ToolMessage), ledger_entries (ActionEntry)
     路由: -> observe_node（无条件）
     """
+    scenario = _get_scenario()
     cert = state.get("current_intent")
     messages = state.get("messages", [])
 
@@ -812,20 +801,15 @@ def act_node(state: ReCAPState) -> dict:
             execution_status=ExecutionStatus.EXECUTING,
         )
 
-        fn = TOOLS_BY_NAME.get(tool_name)
-        if fn is None:
-            content = f"error: unknown tool '{tool_name}'"
-            action.execution_status = ExecutionStatus.UNKNOWN
-        else:
-            try:
-                content = fn.invoke(args)
-                action.execution_status = ExecutionStatus.SUCCESS
-            except DeterministicToolError as e:
-                content = str(e)
-                action.execution_status = ExecutionStatus.BLOCKED
-            except Exception as e:  # noqa: BLE001
-                content = f"error: {e}"
-                action.execution_status = ExecutionStatus.FAILED
+        try:
+            content = scenario.tool_executor.invoke(tool_name, args)
+            action.execution_status = ExecutionStatus.SUCCESS
+        except DeterministicToolError as e:
+            content = str(e)
+            action.execution_status = ExecutionStatus.BLOCKED
+        except Exception as e:  # noqa: BLE001
+            content = f"error: {e}"
+            action.execution_status = ExecutionStatus.FAILED
 
         tool_messages.append(ToolMessage(content=str(content), tool_call_id=call_id))
         ledger.append(ActionEntry(action=action))
@@ -853,6 +837,7 @@ def observe_node(state: ReCAPState) -> dict:
     输出: current_observation, ledger_entries (ObservationEntry/ObligationEntry)
     路由: -> act_observe_check_node（无条件）
     """
+    scenario = _get_scenario()
     action = state.get("current_action")
     cert = state.get("current_intent")
     messages = state.get("messages", [])
@@ -892,25 +877,25 @@ def observe_node(state: ReCAPState) -> dict:
     )
 
     # 确定性证据收集：来源工具 + 正则命中才算收集到该证据。
-    collected = collect_evidence(action, obs.return_content)
+    collected = collect_evidence(action, obs.return_content, scenario.evidence_detectors)
 
     # 证据义务：按证书声明建立 PENDING obligation；obligation_id 基于
     # 证书 + 证据确定性生成，便于 act_observe_check 闭闭合环。
     ledger: list[LedgerEntry] = [ObservationEntry(observation=obs)]
     if cert is not None:
-        for evidence in cert.required_evidence:
-            obligation_id = f"obl-{cert.certificate_id}-{evidence.value}"
+        for evidence_name in cert.required_evidence:
+            obligation_id = f"obl-{cert.certificate_id}-{evidence_name}"
             ledger.append(
                 ObligationEntry(
                     obligation_id=obligation_id,
-                    description=f"evidence '{evidence.value}' from {action.tool_name}",
+                    description=f"evidence '{evidence_name}' from {action.tool_name}",
                     certificate_id=cert.certificate_id,
                     status=ObligationStatus.PENDING,
                 )
             )
         if collected:
             updated = obs.model_copy(
-                update={"evidence_collected": [e.value for e in collected]}
+                update={"evidence_collected": list(collected.keys())}
             )
             ledger[0] = ObservationEntry(observation=updated)
             obs = updated
@@ -958,8 +943,8 @@ def act_observe_check_node(state: ReCAPState) -> dict:
     # 单次工具调用策略：每轮仅一个动作与一个观测，Act→Observe 阶段
     # 一对一对应，无需做 call_id 多路绑定校验（防串线已由单调用保证）。
 
-    required: list[EvidenceType] = list(cert.required_evidence) if cert else []
-    collected: set[EvidenceType] = {EvidenceType(e) for e in obs.evidence_collected}
+    required: list[str] = list(cert.required_evidence) if cert else []
+    collected: set[str] = set(obs.evidence_collected)
 
     failed = action.execution_status != ExecutionStatus.SUCCESS
 
@@ -972,21 +957,21 @@ def act_observe_check_node(state: ReCAPState) -> dict:
                 violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
                 rule_id="R-EVIDENCE-COMPLETE",
                 rule_description="required evidence cannot be collected from a failed action",
-                expected_value=[e.value for e in required],
+                expected_value=required,
                 actual_value=action.execution_status.value,
                 decision=RecoveryAction.KEEP_UNFINISHED,
                 evidence_chain=[f"Action status = {action.execution_status.value}"],
             )
         )
     else:
-        for evidence in required:
+        for evidence_name in required:
             cert_id = cert.certificate_id if cert is not None else ""
-            obligation_id = f"obl-{cert_id}-{evidence.value}"
-            if evidence in collected:
+            obligation_id = f"obl-{cert_id}-{evidence_name}"
+            if evidence_name in collected:
                 obligation_updates.append(
                     ObligationEntry(
                         obligation_id=obligation_id,
-                        description=f"evidence '{evidence.value}' from {action.tool_name}",
+                        description=f"evidence '{evidence_name}' from {action.tool_name}",
                         certificate_id=cert_id,
                         status=ObligationStatus.FULFILLED,
                         created_at=obs.timestamp,
@@ -999,16 +984,16 @@ def act_observe_check_node(state: ReCAPState) -> dict:
                         violation_type=ViolationType.EVIDENCE_INSUFFICIENT,
                         rule_id="R-EVIDENCE-COMPLETE",
                         rule_description=(
-                            f"evidence '{evidence.value}' was declared but not collected "
+                            f"evidence '{evidence_name}' was declared but not collected "
                             f"from {action.tool_name}"
                         ),
                         intent_field="required_evidence",
-                        expected_value=evidence.value,
-                        actual_value=sorted(e.value for e in collected),
+                        expected_value=evidence_name,
+                        actual_value=sorted(collected),
                         decision=RecoveryAction.KEEP_UNFINISHED,
                         evidence_chain=[
-                            f"Intent: required_evidence includes {evidence.value}",
-                            f"Observation: collected evidence = {sorted(e.value for e in collected)}",
+                            f"Intent: required_evidence includes {evidence_name}",
+                            f"Observation: collected evidence = {sorted(collected)}",
                         ],
                     )
                 )
@@ -1017,8 +1002,8 @@ def act_observe_check_node(state: ReCAPState) -> dict:
         # PENDING 义务（例如上一份证书重试前留下的）一并关闭，避免换新
         # 证书重试后旧义务永久悬挂、阻断后续所有子目标。
         closed_ids = {u.obligation_id for u in obligation_updates}
-        for obl, evidence_type, producer in _pending_obligation_evidence():
-            if producer != action.tool_name or evidence_type not in collected:
+        for obl, evidence_type_name, producer in _pending_obligation_evidence():
+            if producer != action.tool_name or evidence_type_name not in collected:
                 continue
             if obl.obligation_id in closed_ids:
                 continue
@@ -1245,8 +1230,8 @@ def replan_node(state: ReCAPState) -> dict:
 
     if RecoveryAction.KEEP_UNFINISHED in actions:
         detail_lines = [
-            f"- missing evidence '{evidence.value}', must be produced by tool '{tool}'"
-            for _, evidence, tool in _pending_obligation_evidence()
+            f"- missing evidence '{evidence_name}', must be produced by tool '{tool}'"
+            for _, evidence_name, tool in _pending_obligation_evidence()
         ]
         detail = ("\nMissing evidence details:\n" + "\n".join(detail_lines)) if detail_lines else ""
         new_messages.append(
@@ -1371,7 +1356,7 @@ def init_node(state: ReCAPState) -> dict:
     ))
 
 
-def build_recap_graph() -> StateGraph:
+def build_recap_graph(scenario: ScenarioConfig) -> StateGraph:
     """构建 ReCAP 护栏增强的 ReAct Agent 图。
 
     图拓扑（每轮完整流程）:
@@ -1437,6 +1422,8 @@ def build_recap_graph() -> StateGraph:
     Returns:
         StateGraph: 未编译的图构建器，调用方需自行 .compile()。
     """
+    set_scenario(scenario)
+
     graph = StateGraph(ReCAPState)
 
     # ── 核心步骤节点 ──
@@ -1514,6 +1501,3 @@ def build_recap_graph() -> StateGraph:
     )
 
     return graph
-
-
-recap_graph_builder = build_recap_graph()
