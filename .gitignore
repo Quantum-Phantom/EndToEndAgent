@@ -15,4 +15,4 @@ wheels/
 # Local data store
 retail_db.jsonl
 output.log
-ledger.jsonl
+ledger/

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -145,16 +147,25 @@ class LedgerStore:
         return [e for e in latest.values() if e.status == ObligationStatus.PENDING]
 
 
-_DEFAULT_LEDGER_PATH = Path(__file__).resolve().parent.parent / "ledger.jsonl"
+_DEFAULT_LEDGER_DIR = Path(__file__).resolve().parent.parent / "ledger"
 
 _store: LedgerStore | None = None
+
+
+def generate_run_ledger_path(ledger_dir: Path | str | None = None) -> Path:
+    """生成本次运行的 JSONL 路径：ledger/run-YYYYMMDD-HHMMSS-<hex>.jsonl。"""
+    directory = Path(ledger_dir) if ledger_dir else _DEFAULT_LEDGER_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    short_id = uuid.uuid4().hex[:8]
+    return directory / f"run-{ts}-{short_id}.jsonl"
 
 
 def get_ledger_store() -> LedgerStore:
     """返回全局共享账本实例（惰性初始化）。"""
     global _store
     if _store is None:
-        _store = LedgerStore(_DEFAULT_LEDGER_PATH)
+        _store = LedgerStore(generate_run_ledger_path())
     return _store
 
 
@@ -163,4 +174,4 @@ def reset_ledger_store(path: Path | str | None = None) -> None:
     global _store
     if isinstance(path, str):
         path = Path(path)
-    _store = LedgerStore(path or _DEFAULT_LEDGER_PATH)
+    _store = LedgerStore(path or generate_run_ledger_path())

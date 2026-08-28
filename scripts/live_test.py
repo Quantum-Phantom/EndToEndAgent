@@ -33,7 +33,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 
 from recap.graph import ScenarioConfig, build_recap_graph, set_llm
-from recap.ledger import EvidenceDetector, reset_ledger_store
+from recap.ledger import EvidenceDetector, generate_run_ledger_path, reset_ledger_store
 from recap.schemas import TaskEntry
 from recap.tools import MultiprocessingToolExecutor
 
@@ -119,8 +119,9 @@ def main() -> int:
         initial_permissions=list(scenario_config_mod.TOOLS_BY_NAME)[:3],
     )
 
-    # 7. 重置账本（每次运行隔离）
-    ledger_path = Path(__file__).resolve().parent.parent / "ledger.jsonl"
+    # 7. 重置账本（每次运行写入独立 JSONL）
+    ledger_path = generate_run_ledger_path()
+    print(f"账本文件: {ledger_path}")
     reset_ledger_store(ledger_path)
 
     # 8. 构建并编译图

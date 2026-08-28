@@ -57,6 +57,7 @@ from recap.ledger import (
     evidence_sources,
     source_tool_for,
     LedgerStore,
+    generate_run_ledger_path,
     get_ledger_store,
     reset_ledger_store,
 )
@@ -121,6 +122,7 @@ __all__ = [
     "evidence_sources",
     "source_tool_for",
     "LedgerStore",
+    "generate_run_ledger_path",
     "get_ledger_store",
     "reset_ledger_store",
     # Tool executor
