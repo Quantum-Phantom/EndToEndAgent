@@ -7,8 +7,12 @@ replaced without modifying any core code.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import sys
 from multiprocessing import Process
 from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -94,3 +98,24 @@ class DirectToolExecutor:
             raise
         except Exception as e:  # noqa: BLE001
             return f"error: {e}"
+
+    def serialize_environment(self, path: str | Path = "environment_snapshot.json") -> None:
+        """将场景的 ``_db`` 对象序列化为 JSON（适用于 dataclass 环境对象）。
+
+        通过 ``tools_by_name`` 中任意工具反查其所属模块，从模块全局变量中
+        取出 ``_db``，用 ``dataclasses.asdict`` 转换后写入 *path*。
+        不可序列化的字段会被静默跳过。
+        """
+        if not self._tools:
+            return
+        sample_fn = next(iter(self._tools.values()))
+        func = getattr(sample_fn, "func", sample_fn)
+        mod = sys.modules[func.__module__]
+        db = getattr(mod, "_db", None)
+        if db is None or not dataclasses.is_dataclass(db) or isinstance(db, type):
+            return
+        d = dataclasses.asdict(db)
+        Path(path).write_text(
+            json.dumps(d, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )

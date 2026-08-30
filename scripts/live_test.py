@@ -1,4 +1,4 @@
-"""ReCAP 真实 LLM 测试：通过 multiprocessing.Pipe 隔离场景环境。
+"""ReCAP 真实 LLM 测试：在主进程中直接执行场景工具。
 
 运行方式（在项目根目录）:
     .venv/Scripts/python.exe scripts/live_test.py
@@ -15,7 +15,6 @@ from __future__ import annotations
 import importlib
 import os
 import sys
-from multiprocessing import Pipe, Process
 from pathlib import Path
 
 if os.name == "nt":
@@ -35,19 +34,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from recap.graph import ScenarioConfig, build_recap_graph, set_llm
 from recap.ledger import EvidenceDetector, generate_run_ledger_path, reset_ledger_store
 from recap.schemas import TaskEntry
-from recap.tools import MultiprocessingToolExecutor
+from recap.tools import DirectToolExecutor
 
 
 def _load_scenario(module_path: str):
     """动态加载场景模块。"""
     return importlib.import_module(module_path)
-
-
-def _scenario_child(conn, runner_module_path: str) -> None:
-    """子进程入口：按模块路径导入场景并服务工具调用。"""
-    import importlib as _il
-    runner_mod = _il.import_module(runner_module_path)
-    runner_mod.run(conn)
 
 
 def build_llm(tool_list) -> ChatOpenAI:
@@ -69,22 +61,15 @@ def main() -> int:
     # 1. 加载场景模块
     scenario_path = os.environ.get("RECAP_SCENARIO", "scenarios.ecommerce.config")
     scenario_config_mod = _load_scenario(scenario_path)
-    scenario_runner_path = scenario_path.replace(".config", ".runner")
 
-    # 2. 启动场景子进程（Pipe 隔离）
-    parent_conn, child_conn = Pipe()
-    child = Process(target=_scenario_child, args=(child_conn, scenario_runner_path), daemon=True)
-    child.start()
-    child_conn.close()
-
-    # 3. 构建证据检测器
+    # 2. 构建证据检测器
     detectors = {
         name: EvidenceDetector(source_tool, pattern)
         for name, (source_tool, pattern) in scenario_config_mod.EVIDENCE_DETECTORS.items()
     }
 
-    # 4. 构建 ScenarioConfig
-    executor = MultiprocessingToolExecutor(parent_conn, child)
+    # 3. 构建 ScenarioConfig
+    executor = DirectToolExecutor(scenario_config_mod.TOOLS_BY_NAME)
     scenario = ScenarioConfig(
         tools_by_name=scenario_config_mod.TOOLS_BY_NAME,
         system_prompt_template=scenario_config_mod.system_prompt_template,
@@ -94,12 +79,12 @@ def main() -> int:
         tool_executor=executor,
     )
 
-    # 5. 注入 LLM
+    # 4. 注入 LLM
     tool_list = list(scenario_config_mod.TOOLS_BY_NAME.values())
     llm_with_tools = build_llm(tool_list)
     set_llm(llm_with_tools)
 
-    # 6. 定义任务
+    # 5. 定义任务
     task_desc = os.environ.get(
         "RECAP_TASK_DESC",
         "帮助已认证客户查询订单、检查库存并发起退款；"
@@ -119,12 +104,12 @@ def main() -> int:
         initial_permissions=list(scenario_config_mod.TOOLS_BY_NAME)[:3],
     )
 
-    # 7. 重置账本（每次运行写入独立 JSONL）
+    # 6. 重置账本（每次运行写入独立 JSONL）
     ledger_path = generate_run_ledger_path()
     print(f"账本文件: {ledger_path}")
     reset_ledger_store(ledger_path)
 
-    # 8. 构建并编译图
+    # 7. 构建并编译图
     graph = build_recap_graph(scenario).compile(checkpointer=MemorySaver())
 
     print("=" * 70)
@@ -165,7 +150,7 @@ def main() -> int:
         _print_state(last_snapshot, include_messages=True)
         raise
     finally:
-        executor.shutdown()
+        executor.serialize_environment("environment_snapshot.json")
 
     _print_state(result) if result is not None else None
     return 0

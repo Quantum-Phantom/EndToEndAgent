@@ -16,3 +16,4 @@ wheels/
 retail_db.jsonl
 output.log
 ledger/
+environment_snapshot.json
