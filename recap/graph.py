@@ -609,6 +609,7 @@ def think_node(state: ReCAPState) -> dict:
             if not missing:
                 try:
                     cert = IntentCertificate.model_validate(data)
+                    cert.round_num = round_num
                 except Exception as e:  # noqa: BLE001
                     cert = None
                     # 保留具体校验失败原因，供 think->act 检查给出可行动反馈，
