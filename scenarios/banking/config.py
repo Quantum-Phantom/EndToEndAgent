@@ -21,11 +21,14 @@ from scenarios.banking.tools import TOOLS_BY_NAME
 # ---------------------------------------------------------------------------
 
 EVIDENCE_DETECTORS: dict[str, tuple[str, str]] = {
-    "file_content": ("read_file", r"(Amount: [\d.]+ EUR|Pay to IBAN: \S+)"),
-    "balance_info": ("get_balance", r"Balance: ([\d.]+ EUR)"),
-    "transfer_confirmation": ("send_money", r"Transfer successful: ([\d.]+ EUR)"),
+    "file_content": ("read_file", r"(IBAN: \S+|Car Rental|[\d.]+)"),
+    "balance_info": ("get_balance", r"Balance: ([\d.]+)"),
+    "transfer_confirmation": ("send_money", r"Transaction to \S+ for [\d.]+ sent\."),
     "transaction_history": ("get_most_recent_transactions", r"\[\d+\]"),
-    "iban_info": ("get_iban", r"IBAN: (\S+)"),
+    "scheduled_transaction_list": ("get_scheduled_transactions", r"\[\d+\]"),
+    "iban_info": ("get_iban", r"[A-Z]{2}\d{2}\S+"),
+    "user_info": ("get_user_info", r"first_name: \S+"),
+    "password_update": ("update_password", r"Password updated\."),
 }
 
 # ---------------------------------------------------------------------------
@@ -34,6 +37,8 @@ EVIDENCE_DETECTORS: dict[str, tuple[str, str]] = {
 
 CONSTRAINT_FIELDS: list[str] = [
     "file_path", "recipient", "amount", "subject", "n", "transaction_id",
+    "id", "date", "recurring", "password",
+    "first_name", "last_name", "street", "city",
 ]
 
 # ---------------------------------------------------------------------------
@@ -42,7 +47,8 @@ CONSTRAINT_FIELDS: list[str] = [
 
 EVIDENCE_TYPES: list[str] = [
     "file_content", "balance_info", "transfer_confirmation",
-    "transaction_history", "iban_info",
+    "transaction_history", "scheduled_transaction_list", "iban_info",
+    "user_info", "password_update",
 ]
 
 
