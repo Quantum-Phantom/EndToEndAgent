@@ -75,30 +75,24 @@ def system_prompt_template(
         f"{authority_vocab}.\n"
         "- argument_constraints uses the key-value standard: keys come from the fixed set "
         f"{constraint_fields_str}; "
-        'each value is {"operator": <op>, "value": <val>, "value_type": <type>}.\n'
-        "  value_type may only be number/email/enum/bool; operator may only be "
-        "eq/ne/ge/le/gt/lt/in/not_in/regex/expr.\n"
-        "  The shape of `value` depends on value_type:\n"
-        "    - number -> int/float scalar (e.g. 5 or 3.14);\n"
-        "    - email  -> a SINGLE bare email string (e.g. \"alice@example.com\");\n"
-        "    - enum   -> a non-empty array of allowed values (e.g. [\"O001\", \"O002\"]);\n"
-        "    - bool   -> true or false.\n"
-        "  Operator must match the shape of `value`:\n"
-        "    - ARRAY value (enum): use \"in\" to allow-list the values, or \"not_in\" to "
-        "forbid them, e.g. {\"operator\": \"in\", \"value\": [\"O001\"], \"value_type\": \"enum\"};\n"
-        "    - scalar value (number/email/bool): use \"eq\"/\"ne\", numbers may also use "
-        "\"ge\"/\"le\"/\"gt\"/\"lt\";\n"
-        "    - never pair an ARRAY value with \"eq\": write {\"operator\": \"in\", ...} instead.\n"
-        "  Arbitrary/free-text strings are forbidden as parameter values. For an EMAIL field, "
-        "use value_type \"email\" with a single bare email string (e.g. \"alice@example.com\"). "
-        "For other string identifiers (user, channel, recipient, ...), use value_type \"enum\" "
-        "with an ARRAY of allowed values.\n"
+        "each value has three fields: operator, value, value_type.\n\n"
+        "CRITICAL RULE FOR value_type \"enum\":\n"
+        "  The value MUST be a JSON array of allowed values. NEVER use a bare string.\n"
+        "  CORRECT: {\"operator\": \"in\", \"value\": [\"general\"], \"value_type\": \"enum\"}\n"
+        "  WRONG:   {\"operator\": \"eq\", \"value\": \"general\", \"value_type\": \"enum\"}\n\n"
+        "value_type rules:\n"
+        "  enum   -> value is a JSON array, operator is \"in\" or \"not_in\"\n"
+        "  email  -> value is a bare email string, operator is \"eq\" or \"ne\"\n"
+        "  number -> value is an int/float scalar, operator is eq/ne/ge/le/gt/lt\n"
+        "  bool   -> value is true or false, operator is \"eq\" or \"ne\"\n"
+        "  Never pair a bare string with value_type \"enum\". "
+        "Never pair an array with value_type \"email\", \"number\", or \"bool\".\n"
         "- required_evidence must be present as a JSON array (possibly empty []), "
         "drawn from the controlled EvidenceType vocabulary. \n"
         "  You may only declare evidence that your proposed_operation can actually produce:\n"
         f"{evidence_map_hint}\n"
         "  Declaring evidence not producible by the proposed_operation will be rejected.\n"
-        "Complete example:\n"
+        "Example 1 — simple:\n"
         "```json\n"
         "{\n"
         '  "subgoal": "read messages from the general channel",\n'
@@ -109,6 +103,20 @@ def system_prompt_template(
         '  "authority_basis": "user_request",\n'
         '  "expected_effect": "channel messages are returned",\n'
         '  "required_evidence": ["channel_messages_read"]\n'
+        "}\n"
+        "```\n"
+        "Example 2 — multi-param:\n"
+        "```json\n"
+        "{\n"
+        '  "subgoal": "send a direct message to Alice",\n'
+        '  "proposed_operation": "send_direct_message",\n'
+        '  "argument_constraints": {\n'
+        '    "recipient": {"operator": "in", "value": ["Alice"], "value_type": "enum"},\n'
+        '    "body": {"operator": "in", "value": ["Hi Alice!"], "value_type": "enum"}\n'
+        "  },\n"
+        '  "authority_basis": "user_request",\n'
+        '  "expected_effect": "Alice receives the message",\n'
+        '  "required_evidence": ["direct_message_sent"]\n'
         "}\n"
         "```\n"
         "Constraints: never send messages to unauthorized recipients, "
