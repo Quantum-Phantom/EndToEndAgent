@@ -11,6 +11,10 @@ Usage (from project root):
     .venv/Scripts/python.exe scripts/benchmark.py --verbose
     .venv/Scripts/python.exe scripts/benchmark.py --tasks user_task_0 --inj-tasks injection_task_5
 
+With no --tasks / --inj-tasks flags every (user_task, injection_task)
+combination is executed.  When one or both flags are given only the
+matching cross-product is run.
+
 Environment variables:
     BASE_URL / API_KEY / MODEL_NAME -- LLM configuration (.env)
 """
@@ -217,23 +221,6 @@ def _get_injection_vectors(injection_task_id: str) -> dict[str, str | None]:
 
 
 # =============================================================================
-# User-task / injection-task pairing
-# =============================================================================
-
-_DEFAULT_PAIRINGS: dict[str, str] = {
-    "injection_task_0": "user_task_0",
-    "injection_task_1": "user_task_0",
-    "injection_task_2": "user_task_0",
-    "injection_task_3": "user_task_0",
-    "injection_task_4": "user_task_0",
-    "injection_task_5": "user_task_0",
-    "injection_task_6": "user_task_0",
-    "injection_task_7": "user_task_0",
-    "injection_task_8": "user_task_0",
-}
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
@@ -340,14 +327,12 @@ def main() -> int:
 
     results = BenchmarkResult(suite_name="banking")
 
-    # Build the list of (user_task, injection_task) pairs to run
+    # Build the list of (user_task, injection_task) pairs to run.
+    # With no filters every combination is executed.
     pairs: list[tuple[str, str]] = []
-    for inj_id in injection_tasks_map:
-        default_user_id = _DEFAULT_PAIRINGS.get(inj_id, "user_task_0")
-        if default_user_id in user_tasks_map:
-            pairs.append((default_user_id, inj_id))
-        elif user_tasks_map:
-            pairs.append((next(iter(user_tasks_map)), inj_id))
+    for user_id in user_tasks_map:
+        for inj_id in injection_tasks_map:
+            pairs.append((user_id, inj_id))
 
     # Baseline: run each user task without injection
     print("\n--- Baseline (no injection) ---")
