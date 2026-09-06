@@ -1,6 +1,5 @@
 """ReCAP banking benchmark: paired evaluation of user tasks and injection tasks.
 
-Mirrors AgentDojo's design where injection tasks are NOT executed separately.
 For each (user_task, injection_task) pair:
   1. Load environment with injection content
   2. Execute the user task prompt
@@ -8,7 +7,7 @@ For each (user_task, injection_task) pair:
 
 Usage (from project root):
     .venv/Scripts/python.exe scripts/benchmark.py
-    .venv/Scripts/python.exe scripts/benchmark.py --verbose
+    .venv/Scripts/python.exe scripts/benchmark.py --verbose --baseline
     .venv/Scripts/python.exe scripts/benchmark.py --tasks user_task_0 --inj-tasks injection_task_5
 
 With no --tasks / --inj-tasks flags every (user_task, injection_task)
@@ -264,6 +263,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Stream node-by-node output during execution",
     )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Run baseline (no injection) tests before paired evaluations",
+    )
     return parser.parse_args()
 
 
@@ -335,23 +339,24 @@ def main() -> int:
             pairs.append((user_id, inj_id))
 
     # Baseline: run each user task without injection
-    print("\n--- Baseline (no injection) ---")
-    for user_id, user_task in user_tasks_map.items():
-        print(f"\n  {user_id}: {user_task.prompt[:60]}...")
-        no_op_inj = tasks_mod.InjectionTask(id="none", goal="")
-        no_op_inj.security = lambda model_output, pre_db, post_db: False
-        result = evaluator.run_user_task_with_injection(
-            user_task=user_task,
-            injection_task=no_op_inj,
-            injection_vectors=None,
-            thread_id=f"baseline-{user_id}",
-        )
-        status = "PASS" if result.utility else "FAIL"
-        print(f"    Utility: {status}")
-        if result.log_path:
-            print(f"    Log: {result.log_path}")
-        if result.error:
-            print(f"    Error: {result.error}")
+    if args.baseline:
+        print("\n--- Baseline (no injection) ---")
+        for user_id, user_task in user_tasks_map.items():
+            print(f"\n  {user_id}: {user_task.prompt[:60]}...")
+            no_op_inj = tasks_mod.InjectionTask(id="none", goal="")
+            no_op_inj.security = lambda model_output, pre_db, post_db: False
+            result = evaluator.run_user_task_with_injection(
+                user_task=user_task,
+                injection_task=no_op_inj,
+                injection_vectors=None,
+                thread_id=f"baseline-{user_id}",
+            )
+            status = "PASS" if result.utility else "FAIL"
+            print(f"    Utility: {status}")
+            if result.log_path:
+                print(f"    Log: {result.log_path}")
+            if result.error:
+                print(f"    Error: {result.error}")
 
     # Paired evaluations
     print("\n--- Paired Evaluations (user task + injection) ---")

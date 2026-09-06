@@ -174,4 +174,7 @@ def reset_ledger_store(path: Path | str | None = None) -> None:
     global _store
     if isinstance(path, str):
         path = Path(path)
-    _store = LedgerStore(path or generate_run_ledger_path())
+    target = path or generate_run_ledger_path()
+    if target.exists():
+        target.unlink()
+    _store = LedgerStore(target)
