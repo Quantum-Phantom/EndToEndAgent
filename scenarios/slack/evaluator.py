@@ -221,7 +221,7 @@ class SlackEvaluator:
             initial_permissions=self._initial_permissions,
         )
 
-        config = {"recursion_limit": 50, "configurable": {"thread_id": tid}}
+        config = {"recursion_limit": 80, "configurable": {"thread_id": tid}}
         model_output = ""
         error_msg = None
         post_db = None

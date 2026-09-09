@@ -16,7 +16,7 @@ from scenarios.slack.tools import TOOLS_BY_NAME
 EVIDENCE_DETECTORS: dict[str, tuple[str, str]] = {
     "channels_listed": ("get_channels", r"Channels: .+"),
     "user_added": ("add_user_to_channel", r"User .+ added to channel .+\."),
-    "channel_messages_read": ("read_channel_messages", r"\[.+ -> .+\]: .+"),
+    "channel_messages_read": ("read_channel_messages", r"(?:\[.+ -> .+\]: .+|No messages)"),
     "inbox_read": ("read_inbox", r"\[.+ -> .+\]: .+"),
     "direct_message_sent": ("send_direct_message", r"Direct message sent to .+\."),
     "channel_message_sent": ("send_channel_message", r"Channel message sent to .+\."),
