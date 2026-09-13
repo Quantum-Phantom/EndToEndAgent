@@ -628,7 +628,6 @@ def think_node(state: ReCAPState) -> dict:
         "round_num": round_num,
         "current_intent": cert,
         "cert_parse_error": cert_parse_error,
-        "consecutive_replan": 0,
         "messages": [ai_message] if ai_message is not None else [],
         "ledger_entries": _record(*ledger)["ledger_entries"],
     }
@@ -1201,9 +1200,14 @@ def replan_node(state: ReCAPState) -> dict:
     latest = results[-1]
     actions = latest.recovery_actions or []
 
-    # 连续 replan 计数：每次进入 replan_node 执行恢复时递增，
-    # think_node 在成功开启新一轮时重置为 0。
-    replan_count = state.get("consecutive_replan", 0) + 1
+    # 连续 replan 计数：replan_node 是每轮必经节点，唯有恢复轮次
+    # （REPLAN / KEEP_UNFINISHED）递增，正常轮次清零；
+    is_recovery_round = any(
+        a in (RecoveryAction.REPLAN, RecoveryAction.KEEP_UNFINISHED) for a in actions
+    )
+    replan_count = (
+        state.get("consecutive_replan", 0) + 1 if is_recovery_round else 0
+    )
 
     # 连续 replan 超限：强制升级人工，防止非 gate 类违规导致的无限循环。
     if replan_count >= _CONSECUTIVE_REPLAN_LIMIT:
