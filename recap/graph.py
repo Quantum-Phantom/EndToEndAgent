@@ -38,6 +38,7 @@ from recap.schemas import (
     RecoveryAction,
     RepairEntry,
     ReplanEntry,
+    SubgoalType,
     TaskEntry,
     TransitionResult,
     TrustLevel,
@@ -68,6 +69,7 @@ class ScenarioConfig:
     evidence_detectors: dict[str, EvidenceDetector]
     constraint_fields: list[str]
     evidence_types: list[str]
+    tool_classes: dict[str, str]  # tool_name -> "info" | "action" (hard-coded per scenario)
     tool_executor: ToolExecutor
 
 
@@ -86,6 +88,11 @@ def _get_scenario() -> ScenarioConfig:
     return _scenario
 
 
+def _tool_class(tool_name: str) -> str:
+    """返回工具的类别（'info'/'action'）；未登记的工具保守视为 'action'。"""
+    return _get_scenario().tool_classes.get(tool_name, "action")
+
+
 # =============================================================================
 # 类型配置：可注入的 LLM 工厂（默认 None，由调用方在编译前注入）
 # =============================================================================
@@ -97,6 +104,7 @@ _llm: Any = None
 # structured output 直接在 state 中携带（见 current_intent 直接赋值路径）。
 _CERT_KEYS = (
     "subgoal",
+    "subgoal_type",
     "proposed_operation",
     "authority_basis",
     "expected_effect",
@@ -282,6 +290,9 @@ _FORCED_CONTINUE_LIMIT = 3
 # 连续 replan 上限：超过后升级人工，防止非 R-OBLIGATION-GATE 类违规导致的无限循环。
 _CONSECUTIVE_REPLAN_LIMIT = 6
 
+# 连续 info 轮上限：达到后强制提示转入 action 或给出最终回答，防只读死循环。
+_INFO_ROUND_LIMIT = 50000
+
 # ObligationEntry.description 的固定格式（见 observe_node）：解析证据名与产出工具。
 _OBLIGATION_DESC_RE = re.compile(r"evidence '(.+?)' from (.+)")
 
@@ -316,6 +327,93 @@ def _current_run_violation_count(rule_id: str) -> int:
         1
         for entry in entries[run_start:]
         if isinstance(entry, ViolationEntry) and entry.violation.rule_id == rule_id
+    )
+
+
+def _check_subgoal_class(cert: IntentCertificate) -> ViolationEvidence | None:
+    """检查 g: subgoal_type 与工具类别双向一致（info<->a 类 / action<->b 类）。"""
+    tool_cls = _tool_class(cert.proposed_operation)
+    if tool_cls == cert.subgoal_type.value:
+        return None
+    return ViolationEvidence(
+        violation_type=ViolationType.INTENT_VIOLATION,
+        rule_id="R-SUBGOAL-CLASS",
+        rule_description=(
+            f"subgoal_type '{cert.subgoal_type.value}' does not match the tool category: "
+            f"'{cert.proposed_operation}' is a '{tool_cls}' tool; 'info' subgoals may only "
+            "use info (read-only) tools and 'action' subgoals may only use action tools"
+        ),
+        intent_field="subgoal_type",
+        expected_value=tool_cls,
+        actual_value=cert.subgoal_type.value,
+        decision=RecoveryAction.REPLAN,
+        evidence_chain=[
+            f"Intent: subgoal_type = {cert.subgoal_type.value}",
+            f"Intent: proposed_operation = {cert.proposed_operation}",
+            f"Tool category: '{cert.proposed_operation}' -> '{tool_cls}'",
+        ],
+    )
+
+
+def _check_info_no_evidence(cert: IntentCertificate) -> ViolationEvidence | None:
+    """检查 h: info 子目标不得声明证据义务（required_evidence 必须为空）。
+
+    info 轮不建义务 => 无 R-OBLIGATION-GATE 单工具锁定 => 天然支持多轮换工具重试。
+    """
+    if cert.subgoal_type != SubgoalType.INFO or not cert.required_evidence:
+        return None
+    return ViolationEvidence(
+        violation_type=ViolationType.INTENT_VIOLATION,
+        rule_id="R-INFO-NO-EVIDENCE",
+        rule_description=(
+            "info subgoals must not declare required_evidence (no evidence obligations are "
+            "created for information gathering); set required_evidence to [] and retry with "
+            "another info tool in a later round if needed"
+        ),
+        intent_field="required_evidence",
+        expected_value=[],
+        actual_value=list(cert.required_evidence),
+        decision=RecoveryAction.REPLAN,
+        evidence_chain=[
+            "Intent: subgoal_type = info",
+            f"Intent: required_evidence = {list(cert.required_evidence)}",
+        ],
+    )
+
+
+def _check_info_round_cap(
+    cert: IntentCertificate, consecutive_info_rounds: int
+) -> ViolationEvidence | None:
+    """检查 i: 连续 info 轮达到 _INFO_ROUND_LIMIT 后要求转入 action 或收尾。
+
+    复用 R-OBLIGATION-GATE 的升级模式：达到上限先 REPLAN；同一运行内本规则
+    违规累计达 _GATE_RETRY_LIMIT 次后 HUMAN_ESCALATION。
+    """
+    if cert.subgoal_type != SubgoalType.INFO:
+        return None
+    if consecutive_info_rounds < _INFO_ROUND_LIMIT:
+        return None
+    retries = _current_run_violation_count("R-INFO-ROUND-LIMIT")
+    decision = (
+        RecoveryAction.HUMAN_ESCALATION
+        if retries >= _GATE_RETRY_LIMIT
+        else RecoveryAction.REPLAN
+    )
+    return ViolationEvidence(
+        violation_type=ViolationType.INTENT_VIOLATION,
+        rule_id="R-INFO-ROUND-LIMIT",
+        rule_description=(
+            f"information gathering reached {consecutive_info_rounds} consecutive info rounds "
+            f"(limit {_INFO_ROUND_LIMIT}); commit to an action subgoal or produce the final "
+            "answer now"
+        ),
+        intent_field="subgoal_type",
+        expected_value=f"<= {_INFO_ROUND_LIMIT} consecutive info rounds",
+        actual_value=consecutive_info_rounds,
+        decision=decision,
+        evidence_chain=[
+            f"retry count = {retries}/{_GATE_RETRY_LIMIT}",
+        ],
     )
 
 
@@ -479,6 +577,7 @@ class ReCAPState(MessagesState):
         current_action      — 本轮工具调用事件。
         current_observation — 本轮环境返回观测。
         cert_parse_error    — 本轮证书解析/校验失败原因（供 think->act 检查反馈）。
+        consecutive_info_rounds — 连续 info 子目标轮数（action 证书清零）。
         ledger_entries      — 共享契约与证据账本（追加写入，不可覆盖）。
         check_results       — 历次阶段检查结果（追加写入）。
     """
@@ -490,6 +589,7 @@ class ReCAPState(MessagesState):
     current_observation: NotRequired[ObservationEvent | None]
     cert_parse_error: NotRequired[str | None]
     consecutive_replan: NotRequired[int]
+    consecutive_info_rounds: NotRequired[int]
     ledger_entries: NotRequired[Annotated[list[LedgerEntry], add]]
     check_results: NotRequired[Annotated[list[TransitionResult], add]]
 
@@ -505,7 +605,7 @@ def think_node(state: ReCAPState) -> dict:
     5. 更新 current_intent、round_num。
 
     输入: state["messages"], state["task_entry"], state["round_num"]
-    输出: round_num, current_intent, messages, ledger_entries
+    输出: round_num, current_intent, cert_parse_error, consecutive_info_rounds, messages, ledger_entries
     路由: 有 tool_calls -> think_act_check_node / 无 -> END
     """
     scenario = _get_scenario()
@@ -537,10 +637,24 @@ def think_node(state: ReCAPState) -> dict:
 
     # 证据产出能力表：让 LLM 只声明拟执行工具真正能产生的证据类型，
     # 避免"声明不可产出证据 -> 永久 EVIDENCE_INSUFFICIENT"死循环。
+    # 仅保留 action 类工具：info 类工具的证据类型不可声明（info 证书的
+    # required_evidence 必须为空），留在提示中会误导模型。
     sources = evidence_sources(scenario.evidence_detectors)
     evidence_map_hint = "\n".join(
         f"  - {tool}: {evs}"
         for tool, evs in sorted(sources.items())
+        if scenario.tool_classes.get(tool) == "action"
+    )
+
+    # 工具类别表：info/action 双向绑定（R-SUBGOAL-CLASS）的提示基础。
+    info_tools = sorted(t for t in tools_available if scenario.tool_classes.get(t) == "info")
+    action_tools = sorted(
+        t for t in tools_available if scenario.tool_classes.get(t, "action") == "action"
+    )
+    tool_class_hint = (
+        "\nTool categories:\n"
+        f"  INFO tools (read-only, class a): {info_tools}\n"
+        f"  ACTION tools (state-changing, class b): {action_tools}\n"
     )
 
     # 上轮净化数据（若有）作为纯事实供本轮规划引用
@@ -564,6 +678,7 @@ def think_node(state: ReCAPState) -> dict:
         purified_hint=purified_hint,
         authority_vocab=authority_vocab,
         constraint_fields_str=constraint_fields_str,
+        tool_class_hint=tool_class_hint,
     )
 
     messages: list = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
@@ -622,12 +737,20 @@ def think_node(state: ReCAPState) -> dict:
         ai_message = ai_message.model_copy(deep=True)
         ai_message.tool_calls = ai_message.tool_calls[:1]
 
+    # 连续 info 轮计数：按本轮解析出的证书类别累计（含后续会被检查拒绝的
+    # info 证书——被拒的只读循环同样消耗轮次，须计入上限）；action 证书清零；
+    # 解析失败轮保持不变。
+    info_rounds = state.get("consecutive_info_rounds", 0)
+    if cert is not None:
+        info_rounds = info_rounds + 1 if cert.subgoal_type == SubgoalType.INFO else 0
+
     ledger: list[LedgerEntry] = [IntentEntry(certificate=cert)] if cert is not None else []
 
     return {
         "round_num": round_num,
         "current_intent": cert,
         "cert_parse_error": cert_parse_error,
+        "consecutive_info_rounds": info_rounds,
         "messages": [ai_message] if ai_message is not None else [],
         "ledger_entries": _record(*ledger)["ledger_entries"],
     }
@@ -638,13 +761,17 @@ def think_act_check_node(state: ReCAPState) -> dict:
 
     职责：
     1. 加载意图证书和实际工具调用参数。
-    2. 六项确定性检查：
+    2. 九项确定性检查：
        a. 操作是否服务于声明子目标（工具名/语义对齐）。
        b. 实际参数是否落在 argument_constraints 允许范围。
        c. 授权 authority_basis 是否真实且未失效。
        d. 是否遵循最小权限原则。
        e. required_evidence 是否可由 proposed_operation 产出（R-EVIDENCE-FEASIBLE）。
        f. 存在未闭合义务时禁止切换子目标（R-OBLIGATION-GATE）。
+       g. subgoal_type 与工具类别（info/action）双向绑定（R-SUBGOAL-CLASS）。
+       h. info 子目标不得声明 required_evidence（R-INFO-NO-EVIDENCE）。
+       i. 连续 info 轮达到 _INFO_ROUND_LIMIT 后强制转入 action 或收尾
+          （R-INFO-ROUND-LIMIT）。
     3. 违规恢复：参数越界 -> PARAMETER_FIX 自动收缩；
        目标/授权/证据可行性问题 -> REPLAN 回 think_node；
        高风险未知 -> BLOCK + HUMAN_ESCALATION。
@@ -717,7 +844,17 @@ def think_act_check_node(state: ReCAPState) -> dict:
     if auth_v:
         violations.append(auth_v)
 
-    # 证书级检查：证据可行性与未闭合义务门槛（不依赖具体 tool_call 参数）
+    # 证书级检查：类别绑定 / info 证据禁令 / info 轮上限 / 证据可行性与未闭合义务门槛
+    # （不依赖具体 tool_call 参数）
+    sc_v = _check_subgoal_class(cert)
+    if sc_v:
+        violations.append(sc_v)
+    ne_v = _check_info_no_evidence(cert)
+    if ne_v:
+        violations.append(ne_v)
+    cap_v = _check_info_round_cap(cert, state.get("consecutive_info_rounds", 0))
+    if cap_v:
+        violations.append(cap_v)
     violations.extend(_check_evidence_feasibility(cert))
     violations.extend(_check_open_obligations(cert))
 

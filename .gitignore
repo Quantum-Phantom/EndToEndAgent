@@ -18,3 +18,4 @@ output.log
 ledger/
 logs/
 environment_snapshot.json
+docs/

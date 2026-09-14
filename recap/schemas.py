@@ -107,6 +107,19 @@ class AuthorityBasis(str, Enum):
     VERIFIED_SESSION = "verified_session"
 
 
+class SubgoalType(str, Enum):
+    """子目标类别——与工具分类（info/action）双向绑定。
+
+    INFO:   信息收集子目标。仅可调用 info 类工具；允许多轮重试/换工具；
+            不得声明 required_evidence（不产生证据义务）。
+    ACTION: 环境动作子目标。仅可调用 action 类工具；维持既有单工具 +
+            证据义务（regex 闭环、R-OBLIGATION-GATE）语义不变。
+    """
+
+    INFO = "info"
+    ACTION = "action"
+
+
 class ConstraintValueType(str, Enum):
     """约束值类型——argument_constraints 中每条约束的值的受控类型。
 
@@ -395,6 +408,11 @@ class IntentCertificate(BaseModel):
 
     certificate_id: str = Field(default_factory=lambda: f"cert-{uuid.uuid4().hex[:12]}")
     round_num: int = Field(default=0, ge=0, description="当前 ReAct 轮次")
+    subgoal_type: SubgoalType = Field(
+        default=SubgoalType.ACTION,
+        description="子目标类别：'info'（信息收集，仅限 info 类工具，required_evidence 必须为空，"
+        "可多轮换工具重试）/ 'action'（环境动作，仅限 action 类工具，证据义务规则不变）",
+    )
     subgoal: str = Field(..., min_length=1, description="本轮具体子目标")
     proposed_operation: str = Field(..., min_length=1, description="拟执行的工具/动作名称")
     argument_constraints: dict[str, Constraint] = Field(

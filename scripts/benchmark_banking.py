@@ -292,6 +292,7 @@ def main() -> int:
         evidence_detectors=detectors,
         constraint_fields=scenario_mod.CONSTRAINT_FIELDS,
         evidence_types=scenario_mod.EVIDENCE_TYPES,
+        tool_classes=scenario_mod.TOOL_CLASSES,
         tool_executor=executor,
     )
 
