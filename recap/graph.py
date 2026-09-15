@@ -652,9 +652,8 @@ def think_node(state: ReCAPState) -> dict:
         t for t in tools_available if scenario.tool_classes.get(t, "action") == "action"
     )
     tool_class_hint = (
-        "\nTool categories:\n"
-        f"  INFO tools (read-only, class a): {info_tools}\n"
-        f"  ACTION tools (state-changing, class b): {action_tools}\n"
+        f"  INFO (read-only): {', '.join(info_tools) or 'none'}\n"
+        f"  ACTION (state-changing): {', '.join(action_tools) or 'none'}\n"
     )
 
     # 上轮净化数据（若有）作为纯事实供本轮规划引用
