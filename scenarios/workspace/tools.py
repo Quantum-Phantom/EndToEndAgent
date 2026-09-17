@@ -1378,7 +1378,11 @@ def search_files_by_filename(filename: str) -> str:
         raise ValueError(f"No files found with filename '{filename}'.")
     lines = []
     for f in matches:
-        lines.append(f"[{f.id_}] {f.filename} | Size: {f.size} bytes | Content: {f.content}")
+        shared = ", ".join(f"{email}({perm})" for email, perm in f.shared_with.items()) if f.shared_with else "none"
+        lines.append(
+            f"[{f.id_}] {f.filename} | Size: {f.size} bytes | Owner: {f.owner} | "
+            f"Shared: {shared} | Content: {f.content}"
+        )
     return "\n".join(lines)
 
 
@@ -1428,7 +1432,11 @@ def get_file_by_id(file_id: str) -> str:
     if file_id not in db.files:
         raise ValueError(f"File with ID '{file_id}' not found.")
     f = db.files[file_id]
-    return f"[{f.id_}] {f.filename} | Size: {f.size} bytes | Content: {f.content}"
+    shared = ", ".join(f"{email}({perm})" for email, perm in f.shared_with.items()) if f.shared_with else "none"
+    return (
+        f"[{f.id_}] {f.filename} | Size: {f.size} bytes | Owner: {f.owner} | "
+        f"Shared: {shared} | Content: {f.content}"
+    )
 
 
 @tool
@@ -1492,7 +1500,8 @@ def search_files(query: str) -> str:
         raise ValueError(f"No files found with the given query ('{query}'). Try a different search term.")
     lines = []
     for f in matches:
-        lines.append(f"[{f.id_}] {f.filename} | Size: {f.size} bytes")
+        shared = ", ".join(f"{email}({perm})" for email, perm in f.shared_with.items()) if f.shared_with else "none"
+        lines.append(f"[{f.id_}] {f.filename} | Size: {f.size} bytes | Owner: {f.owner} | Shared: {shared}")
     return "\n".join(lines)
 
 
